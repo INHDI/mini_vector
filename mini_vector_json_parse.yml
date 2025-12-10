@@ -1,9 +1,12 @@
-# mini_vector.yml
 sources:
   stdin:
     type: stdin
 
 transforms:
+  parse_message:
+    type: json_parse
+    field: message
+
   add_type:
     type: add_field
     field: log_type
@@ -13,9 +16,8 @@ router:
   field: log_type
   routes:
     - equals: linux_syslog
-      sink: http_out
+      sink: console
 
 sinks:
-  http_out:
-    type: http
-    endpoint: "http://127.0.0.1:2021/logs"
+  console:
+    type: console

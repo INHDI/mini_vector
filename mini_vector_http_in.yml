@@ -1,7 +1,8 @@
-# mini_vector.yml
 sources:
-  stdin:
-    type: stdin
+  http_in:
+    type: http
+    address: "0.0.0.0:19000"
+    path: "/ingest"
 
 transforms:
   add_type:
@@ -13,9 +14,8 @@ router:
   field: log_type
   routes:
     - equals: linux_syslog
-      sink: http_out
+      sink: console
 
 sinks:
-  http_out:
-    type: http
-    endpoint: "http://127.0.0.1:2021/logs"
+  console:
+    type: console

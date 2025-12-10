@@ -9,9 +9,103 @@ use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{info, warn};
 
+use std::net::SocketAddr;
+use axum::{
+    routing::post,
+    Router as HttpRouter,
+    extract::State,
+    Json,
+};
+use serde_json::Value as JsonValue;
+
 /// =========================
 ///  Event model
 /// =========================
+
+#[derive(Clone)]
+pub struct HttpSourceState {
+    tx: mpsc::Sender<Event>,
+}
+
+pub struct HttpSource {
+    addr: SocketAddr,
+    path: String,
+}
+
+impl HttpSource {
+    pub fn new(addr: SocketAddr, path: String) -> Self {
+        Self { addr, path }
+    }
+}
+
+async fn http_source_handler(
+    State(state): State<HttpSourceState>,
+    Json(body): Json<JsonValue>,
+) {
+    // body là JSON, ta map sang Event.fields
+    let mut event = Event::new();
+
+    match body {
+        JsonValue::Object(map) => {
+            for (k, v) in map {
+                let v = match v {
+                    JsonValue::String(s) => Value::String(s),
+                    JsonValue::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            Value::Integer(i)
+                        } else if let Some(f) = n.as_f64() {
+                            Value::Float(f)
+                        } else {
+                            Value::String(n.to_string())
+                        }
+                    }
+                    JsonValue::Bool(b) => Value::Bool(b),
+                    _ => Value::String(v.to_string()),
+                };
+                event.insert(k, v);
+            }
+        }
+        other => {
+            event.insert("message", other.to_string());
+        }
+    }
+
+    if let Err(err) = state.tx.send(event).await {
+        warn!("HttpSource: failed to send event to pipeline: {}", err);
+    }
+}
+
+#[async_trait]
+impl Source for HttpSource {
+    async fn run(self: Box<Self>, tx: mpsc::Sender<Event>) {
+        info!(
+            "HttpSource listening on http://{}{}",
+            self.addr, self.path
+        );
+
+        let state = HttpSourceState { tx };
+        let app = HttpRouter::new()
+            .route(&self.path, post(http_source_handler))
+            .with_state(state);
+
+            let listener = match tokio::net::TcpListener::bind(self.addr).await {
+                Ok(l) => l,
+                Err(err) => {
+                    warn!(
+                        "HttpSource: failed to bind address {}: {}",
+                        self.addr, err
+                    );
+                    return; // dừng source này, nhưng không kill cả process
+                }
+            };
+
+        if let Err(err) = axum::serve(listener, app).await {
+            warn!("HttpSource error: {}", err);
+        }
+
+        info!("HttpSource exiting");
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
@@ -164,12 +258,116 @@ impl Transform for ContainsFilterTransform {
     }
 }
 
+pub struct JsonParseTransform {
+    from_field: String,
+}
+
+impl JsonParseTransform {
+    pub fn new(from_field: String) -> Self {
+        Self { from_field }
+    }
+}
+
+impl Transform for JsonParseTransform {
+    fn apply(&self, event: &mut Event) -> bool {
+        // lấy chuỗi từ field cần parse
+        let raw = match event.fields.get(&self.from_field) {
+            Some(Value::String(s)) => s.clone(),
+            _ => return true, // không có field / không phải string -> bỏ qua
+        };
+
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Object(map)) => {
+                for (k, v) in map {
+                    let v = match v {
+                        serde_json::Value::String(s) => Value::String(s),
+                        serde_json::Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                Value::Integer(i)
+                            } else if let Some(f) = n.as_f64() {
+                                Value::Float(f)
+                            } else {
+                                Value::String(n.to_string())
+                            }
+                        }
+                        serde_json::Value::Bool(b) => Value::Bool(b),
+                        other => Value::String(other.to_string()),
+                    };
+                    event.insert(k, v);
+                }
+                true
+            }
+            _ => {
+                warn!(
+                    "JsonParseTransform: failed to parse '{}' as JSON",
+                    self.from_field
+                );
+                true // giữ nguyên event
+            }
+        }
+    }
+}
+
+
 /// =========================
 ///  Implementations: Sinks
 /// =========================
 
+pub struct HttpSink {
+    name: String,
+    endpoint: String,
+    client: reqwest::Client,
+}
+
 pub struct ConsoleSink {
     name: String,
+}
+
+impl HttpSink {
+    pub fn new(name: String, endpoint: String) -> Self {
+        Self {
+            name,
+            endpoint,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+
+#[async_trait]
+impl Sink for HttpSink {
+    async fn run(self: Box<Self>, mut rx: mpsc::Receiver<Event>) {
+        info!("HttpSink[{}] started, endpoint={}", self.name, self.endpoint);
+
+        while let Some(event) = rx.recv().await {
+            // Đơn giản: gửi từng event một (sau này có thể batch)
+            let body = serde_json::to_value(&event).unwrap_or_else(|_| serde_json::json!({}));
+
+            let res = self
+                .client
+                .post(&self.endpoint)
+                .json(&body)
+                .send()
+                .await;
+
+            match res {
+                Ok(r) => {
+                    if !r.status().is_success() {
+                        warn!(
+                            "HttpSink[{}] status={} for event",
+                            self.name,
+                            r.status()
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!("HttpSink[{}] error sending event: {}", self.name, err);
+                }
+            }
+        }
+
+        info!("HttpSink[{}] exiting", self.name);
+    }
 }
 
 impl ConsoleSink {
@@ -205,12 +403,12 @@ pub struct RouterConfig {
     pub routes: Vec<RouteRuleConfig>,
 }
 
-pub struct Router {
+pub struct EventRouter {
     field: String,
     rules: Vec<RouteRuleConfig>,
 }
 
-impl Router {
+impl EventRouter {
     pub fn new(cfg: RouterConfig) -> Self {
         Self {
             field: cfg.field,
@@ -218,7 +416,6 @@ impl Router {
         }
     }
 
-    /// Trả về danh sách sink_id phù hợp với event.
     pub fn route(&self, event: &Event) -> Vec<String> {
         let mut result = Vec::new();
         let v_opt = event.get_str(&self.field);
@@ -229,7 +426,6 @@ impl Router {
                 }
             }
         }
-        // Nếu không match rule nào, có thể trả về sink default (tuỳ anh thiết kế)
         result
     }
 }
@@ -242,6 +438,12 @@ impl Router {
 pub struct SourceConfig {
     #[serde(rename = "type")]
     pub kind: String,
+
+    // HTTP source config:
+    #[serde(default)]
+    pub address: Option<String>, // "0.0.0.0:9000"
+    #[serde(default)]
+    pub path: Option<String>,    // "/ingest"
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,6 +466,11 @@ pub struct TransformConfig {
 pub struct SinkConfig {
     #[serde(rename = "type")]
     pub kind: String,
+    // HTTP sink config:
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +488,23 @@ pub struct FullConfig {
 fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source>> {
     match cfg.kind.as_str() {
         "stdin" => Ok(Box::new(StdinSource)),
+        "http" => {
+            let addr_str = cfg
+                .address
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("source '{}' (http) missing 'address'", name))?;
+
+            let path = cfg
+                .path
+                .clone()
+                .unwrap_or_else(|| "/ingest".to_string());
+
+            let addr: SocketAddr = addr_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid address '{}' for source '{}': {}", addr_str, name, e))?;
+
+            Ok(Box::new(HttpSource::new(addr, path)))
+        }
         other => anyhow::bail!("Unknown source type '{}' for '{}'", other, name),
     }
 }
@@ -309,13 +533,28 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'needle'", name))?;
             Ok(Box::new(ContainsFilterTransform::new(field, needle)))
         }
+        "json_parse" => {
+            let field = cfg
+                .field
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (json_parse) missing 'field'", name))?;
+            Ok(Box::new(JsonParseTransform::new(field)))
+        }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
     }
 }
 
+
 fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
     match cfg.kind.as_str() {
         "console" => Ok(Box::new(ConsoleSink::new(name.to_string()))),
+        "http" => {
+            let endpoint = cfg
+                .endpoint
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("sink '{}' (http) missing 'endpoint'", name))?;
+            Ok(Box::new(HttpSink::new(name.to_string(), endpoint)))
+        }
         other => anyhow::bail!("Unknown sink type '{}' for '{}'", other, name),
     }
 }
@@ -351,8 +590,8 @@ async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
     // 4. Build router
     let router = config
         .router
-        .map(Router::new)
-        .unwrap_or_else(|| Router::new(RouterConfig {
+        .map(EventRouter::new)
+        .unwrap_or_else(|| EventRouter::new(RouterConfig {
             field: "log_type".to_string(),
             routes: Vec::new(),
         }));
