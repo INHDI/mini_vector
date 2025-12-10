@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::event::{Event, Value};
+use crate::event::{value_from_json, Event};
 use crate::sources::Source;
 
 #[derive(Clone)]
@@ -31,21 +31,7 @@ async fn http_source_handler(State(state): State<HttpSourceState>, Json(body): J
     match body {
         JsonValue::Object(map) => {
             for (k, v) in map {
-                let v = match v {
-                    JsonValue::String(s) => Value::String(s),
-                    JsonValue::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            Value::Integer(i)
-                        } else if let Some(f) = n.as_f64() {
-                            Value::Float(f)
-                        } else {
-                            Value::String(n.to_string())
-                        }
-                    }
-                    JsonValue::Bool(b) => Value::Bool(b),
-                    _ => Value::String(v.to_string()),
-                };
-                event.insert(k, v);
+                event.insert(k, value_from_json(&v));
             }
         }
         other => {

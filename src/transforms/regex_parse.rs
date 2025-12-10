@@ -9,6 +9,7 @@ pub struct RegexParseTransform {
     pub regex: Regex,
     pub drop_on_error: bool,
     pub remove_source: bool,
+    pub target_prefix: Option<String>,
 }
 
 impl RegexParseTransform {
@@ -17,6 +18,7 @@ impl RegexParseTransform {
         pattern: String,
         drop_on_error: bool,
         remove_source: bool,
+        target_prefix: Option<String>,
     ) -> anyhow::Result<Self> {
         let regex = Regex::new(&pattern)
             .map_err(|e| anyhow::anyhow!("invalid regex pattern '{}': {}", pattern, e))?;
@@ -25,6 +27,7 @@ impl RegexParseTransform {
             regex,
             drop_on_error,
             remove_source,
+            target_prefix,
         })
     }
 }
@@ -58,7 +61,12 @@ impl Transform for RegexParseTransform {
                 .filter(|n| *n != "0")
             {
                 if let Some(m) = caps.name(name) {
-                    event.insert(name.to_string(), m.as_str().to_string());
+                    let key = if let Some(prefix) = &self.target_prefix {
+                        format!("{}.{}", prefix, name)
+                    } else {
+                        name.to_string()
+                    };
+                    event.insert(key, m.as_str().to_string());
                 }
             }
 
@@ -72,7 +80,61 @@ impl Transform for RegexParseTransform {
                 "RegexParseTransform: regex did not match field '{}' value: {}",
                 self.field, raw
             );
+            if !self.drop_on_error {
+                event.insert("regex_parse_error".to_string(), true);
+            }
             !self.drop_on_error
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_named_groups_and_removes_source() {
+        let mut event = Event::new();
+        event.insert("message", "prog: hello");
+        let t = RegexParseTransform::new(
+            "message".into(),
+            r"(?P<program>\w+): (?P<msg>.+)".into(),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        let keep = t.apply(&mut event);
+        assert!(keep);
+        assert!(!event.fields.contains_key("message"));
+        assert_eq!(
+            event.fields.get("program"),
+            Some(&Value::String("prog".to_string()))
+        );
+        assert_eq!(
+            event.fields.get("msg"),
+            Some(&Value::String("hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn uses_target_prefix_and_sets_error_flag_on_non_drop() {
+        let mut event = Event::new();
+        event.insert("message", "no match");
+        let t = RegexParseTransform::new(
+            "message".into(),
+            r"(?P<program>\w+): (?P<msg>.+)".into(),
+            false,
+            false,
+            Some("parsed".to_string()),
+        )
+        .unwrap();
+        let keep = t.apply(&mut event);
+        assert!(keep);
+        assert_eq!(
+            event.fields.get("regex_parse_error"),
+            Some(&Value::Bool(true))
+        );
+        assert!(event.fields.get("parsed.program").is_none());
     }
 }

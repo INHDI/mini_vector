@@ -86,10 +86,12 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' (json_parse) missing 'field'", name))?;
             let drop_on_error = cfg.drop_on_error.unwrap_or(false);
             let remove_source = cfg.remove_source.unwrap_or(false);
+            let target_prefix = cfg.target_prefix.clone();
             Ok(Box::new(JsonParseTransform::new(
                 field,
                 drop_on_error,
                 remove_source,
+                target_prefix,
             )))
         }
         "normalize_schema" => {
@@ -107,7 +109,8 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .script
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' (script) missing 'script'", name))?;
-            Ok(Box::new(ScriptTransform::new(script)))
+            let t = ScriptTransform::compile(script)?;
+            Ok(Box::new(t))
         }
         "regex_parse" => {
             let field = cfg
@@ -121,8 +124,9 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
 
             let drop_on_error = cfg.drop_on_error.unwrap_or(false);
             let remove_source = cfg.remove_source.unwrap_or(false);
+            let target_prefix = cfg.target_prefix.clone();
 
-            let t = RegexParseTransform::new(field, pattern, drop_on_error, remove_source)?;
+            let t = RegexParseTransform::new(field, pattern, drop_on_error, remove_source, target_prefix)?;
             Ok(Box::new(t))
         }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
