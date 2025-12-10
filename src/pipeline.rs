@@ -1,0 +1,240 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+use tokio::task;
+use tracing::{info, warn};
+
+use crate::config::{FullConfig, SinkConfig, SourceConfig, TransformConfig};
+use crate::event::{Event, Value};
+use crate::router::{EventRouter, RouterConfig};
+use crate::sinks::console::ConsoleSink;
+use crate::sinks::http::HttpSink;
+use crate::sinks::Sink;
+use crate::sources::http::HttpSource;
+use crate::sources::stdin::StdinSource;
+use crate::sources::Source;
+use crate::transforms::add_field::AddFieldTransform;
+use crate::transforms::contains_filter::ContainsFilterTransform;
+use crate::transforms::json_parse::JsonParseTransform;
+use crate::transforms::normalize_schema::NormalizeSchemaTransform;
+use crate::transforms::regex_parse::RegexParseTransform;
+use crate::transforms::script::ScriptTransform;
+use crate::transforms::Transform;
+
+fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source>> {
+    match cfg.kind.as_str() {
+        "stdin" => Ok(Box::new(StdinSource)),
+        "http" => {
+            let addr_str = cfg
+                .address
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("source '{}' (http) missing 'address'", name))?;
+
+            let path = cfg
+                .path
+                .clone()
+                .unwrap_or_else(|| "/ingest".to_string());
+
+            let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid address '{}' for source '{}': {}",
+                    addr_str,
+                    name,
+                    e
+                )
+            })?;
+
+            Ok(Box::new(HttpSource::new(addr, path)))
+        }
+        other => anyhow::bail!("Unknown source type '{}' for '{}'", other, name),
+    }
+}
+
+fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn Transform>> {
+    match cfg.kind.as_str() {
+        "add_field" => {
+            let field = cfg
+                .field
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'field'", name))?;
+            let value = cfg
+                .value
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'value'", name))?;
+            Ok(Box::new(AddFieldTransform::new(
+                field,
+                Value::from(value),
+            )))
+        }
+        "contains_filter" => {
+            let field = cfg
+                .field
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'field'", name))?;
+            let needle = cfg
+                .needle
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'needle'", name))?;
+            Ok(Box::new(ContainsFilterTransform::new(field, needle)))
+        }
+        "json_parse" => {
+            let field = cfg
+                .field
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (json_parse) missing 'field'", name))?;
+            let drop_on_error = cfg.drop_on_error.unwrap_or(false);
+            let remove_source = cfg.remove_source.unwrap_or(false);
+            Ok(Box::new(JsonParseTransform::new(
+                field,
+                drop_on_error,
+                remove_source,
+            )))
+        }
+        "normalize_schema" => {
+            Ok(Box::new(NormalizeSchemaTransform::new(
+                cfg.timestamp_field.clone(),
+                cfg.host_field.clone(),
+                cfg.severity_field.clone(),
+                cfg.program_field.clone(),
+                cfg.message_field.clone(),
+                cfg.default_log_type.clone(),
+            )))
+        }
+        "script" => {
+            let script = cfg
+                .script
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (script) missing 'script'", name))?;
+            Ok(Box::new(ScriptTransform::new(script)))
+        }
+        "regex_parse" => {
+            let field = cfg
+                .field
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (regex_parse) missing 'field'", name))?;
+            let pattern = cfg
+                .pattern
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (regex_parse) missing 'pattern'", name))?;
+
+            let drop_on_error = cfg.drop_on_error.unwrap_or(false);
+            let remove_source = cfg.remove_source.unwrap_or(false);
+
+            let t = RegexParseTransform::new(field, pattern, drop_on_error, remove_source)?;
+            Ok(Box::new(t))
+        }
+        other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
+    }
+}
+
+fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
+    match cfg.kind.as_str() {
+        "console" => Ok(Box::new(ConsoleSink::new(name.to_string()))),
+        "http" => {
+            let endpoint = cfg
+                .endpoint
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("sink '{}' (http) missing 'endpoint'", name))?;
+            Ok(Box::new(HttpSink::new(
+                name.to_string(),
+                endpoint,
+            )))
+        }
+        other => anyhow::bail!("Unknown sink type '{}' for '{}'", other, name),
+    }
+}
+
+pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
+    let (ingress_tx, mut ingress_rx) = mpsc::channel::<Event>(1024);
+
+    let mut source_tasks = Vec::new();
+    for (name, scfg) in &config.sources {
+        let src = build_source(name, scfg)?;
+        let tx = ingress_tx.clone();
+        source_tasks.push(task::spawn(async move {
+            src.run(tx).await;
+        }));
+    }
+    drop(ingress_tx);
+
+    let mut transforms: Vec<Arc<dyn Transform>> = Vec::new();
+    if let Some(tcfgs) = &config.transforms {
+        for (name, tcfg) in tcfgs {
+            let t = build_transform(name, tcfg)?;
+            transforms.push(Arc::from(t));
+        }
+    }
+
+    let router = config
+        .router
+        .map(EventRouter::new)
+        .unwrap_or_else(|| EventRouter::new(RouterConfig {
+            field: "log_type".to_string(),
+            routes: Vec::new(),
+        }));
+
+    let mut sink_senders: HashMap<String, mpsc::Sender<Event>> = HashMap::new();
+    let mut sink_tasks = Vec::new();
+
+    for (name, scfg) in &config.sinks {
+        let sink = build_sink(name, scfg)?;
+        let (tx, rx) = mpsc::channel::<Event>(1024);
+        sink_senders.insert(name.clone(), tx);
+        sink_tasks.push(task::spawn(async move {
+            sink.run(rx).await;
+        }));
+    }
+
+    let router = Arc::new(router);
+    let sink_senders = Arc::new(sink_senders);
+    let transforms = Arc::new(transforms);
+
+    let pipeline_task = {
+        let router = router.clone();
+        let sink_senders = sink_senders.clone();
+        let transforms = transforms.clone();
+
+        task::spawn(async move {
+            while let Some(mut event) = ingress_rx.recv().await {
+                let mut keep = true;
+                for t in transforms.iter() {
+                    if !t.apply(&mut event) {
+                        keep = false;
+                        break;
+                    }
+                }
+                if !keep {
+                    continue;
+                }
+
+                let targets = router.route(&event);
+                if targets.is_empty() {
+                    continue;
+                }
+
+                for sink_id in targets {
+                    if let Some(tx) = sink_senders.get(&sink_id) {
+                        if tx.send(event.clone()).await.is_err() {
+                            warn!("Sink '{}' seems closed", sink_id);
+                        }
+                    } else {
+                        warn!("No sink named '{}' in routing", sink_id);
+                    }
+                }
+            }
+            info!("Pipeline main loop exiting (no more events)");
+        })
+    };
+
+    for t in source_tasks {
+        let _ = t.await;
+    }
+    let _ = pipeline_task.await;
+    for t in sink_tasks {
+        let _ = t.await;
+    }
+
+    Ok(())
+}
