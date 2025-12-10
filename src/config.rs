@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -21,6 +21,9 @@ pub struct SourceConfig {
 pub struct TransformConfig {
     #[serde(rename = "type")]
     pub kind: String,
+
+    #[serde(default)]
+    pub inputs: Vec<String>,
 
     // add_field / contains_filter / json_parse
     #[serde(default)]
@@ -65,9 +68,38 @@ pub struct TransformConfig {
 pub struct SinkConfig {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
+    pub inputs: Vec<String>,
     // HTTP sink config:
     #[serde(default)]
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub buffer: Option<SinkBufferConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SinkBufferConfig {
+    #[serde(default = "default_buffer_size")]
+    pub max_events: usize,
+    #[serde(default)]
+    pub when_full: WhenFull,
+}
+
+fn default_buffer_size() -> usize {
+    1024
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenFull {
+    Block,
+    DropNew,
+}
+
+impl Default for WhenFull {
+    fn default() -> Self {
+        WhenFull::Block
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +128,12 @@ impl FullConfig {
                     anyhow::bail!("router route sink '{}' not defined in sinks", route.sink);
                 }
             }
+        }
+
+        let mut node_names: HashSet<String> =
+            self.sources.keys().cloned().collect();
+        if let Some(transforms) = &self.transforms {
+            node_names.extend(transforms.keys().cloned());
         }
 
         if let Some(transforms) = &self.transforms {
@@ -141,6 +179,43 @@ impl FullConfig {
                     }
                     "normalize_schema" => { /* no required fields */ }
                     other => anyhow::bail!("unknown transform type '{}' for '{}'", other, name),
+                }
+            }
+        }
+
+        // Validate inputs topology if provided
+        let has_inputs = self
+            .transforms
+            .as_ref()
+            .map(|t| t.values().any(|cfg| !cfg.inputs.is_empty()))
+            .unwrap_or(false)
+            || self
+                .sinks
+                .values()
+                .any(|cfg| !cfg.inputs.is_empty());
+
+        if has_inputs {
+            if let Some(transforms) = &self.transforms {
+                for (name, t) in transforms {
+                    if t.inputs.is_empty() {
+                        anyhow::bail!("transform '{}' uses inputs mode but 'inputs' is empty", name);
+                    }
+                    for inp in &t.inputs {
+                        if !node_names.contains(inp) {
+                            anyhow::bail!("transform '{}' input '{}' not found", name, inp);
+                        }
+                    }
+                }
+            }
+
+            for (sink_name, sink_cfg) in &self.sinks {
+                if sink_cfg.inputs.is_empty() {
+                    anyhow::bail!("sink '{}' uses inputs mode but 'inputs' is empty", sink_name);
+                }
+                for inp in &sink_cfg.inputs {
+                    if !node_names.contains(inp) {
+                        anyhow::bail!("sink '{}' input '{}' not found", sink_name, inp);
+                    }
                 }
             }
         }

@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{info, warn};
 
-use crate::config::{FullConfig, SinkConfig, SourceConfig, TransformConfig};
+use crate::config::{
+    FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig, WhenFull,
+};
 use crate::event::{Event, Value};
 use crate::router::{EventRouter, RouterConfig};
 use crate::sinks::console::ConsoleSink;
@@ -22,6 +24,8 @@ use crate::transforms::normalize_schema::NormalizeSchemaTransform;
 use crate::transforms::regex_parse::RegexParseTransform;
 use crate::transforms::script::ScriptTransform;
 use crate::transforms::Transform;
+
+const DEFAULT_CHANNEL_SIZE: usize = 1024;
 
 fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source>> {
     match cfg.kind.as_str() {
@@ -150,7 +154,30 @@ fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
     }
 }
 
-pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
+#[derive(Clone)]
+struct Downstream {
+    tx: mpsc::Sender<Event>,
+    mode: WhenFull,
+}
+
+async fn fan_out(event: Event, downstreams: &[Downstream]) {
+    for ds in downstreams {
+        match ds.mode {
+            WhenFull::Block => {
+                if let Err(err) = ds.tx.send(event.clone()).await {
+                    warn!("downstream send failed: {}", err);
+                }
+            }
+            WhenFull::DropNew => {
+                if let Err(err) = ds.tx.try_send(event.clone()) {
+                    warn!("downstream drop_new: {}", err);
+                }
+            }
+        }
+    }
+}
+
+async fn run_pipeline_linear(config: FullConfig) -> anyhow::Result<()> {
     let (ingress_tx, mut ingress_rx) = mpsc::channel::<Event>(1024);
 
     let mut source_tasks = Vec::new();
@@ -236,6 +263,133 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
         let _ = t.await;
     }
     let _ = pipeline_task.await;
+    for t in sink_tasks {
+        let _ = t.await;
+    }
+
+    Ok(())
+}
+
+pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
+    let has_inputs = config
+        .transforms
+        .as_ref()
+        .map(|t| t.values().any(|cfg| !cfg.inputs.is_empty()))
+        .unwrap_or(false)
+        || config
+            .sinks
+            .values()
+            .any(|cfg| !cfg.inputs.is_empty());
+
+    if !has_inputs {
+        return run_pipeline_linear(config).await;
+    }
+
+    // Build channels for transforms and sinks
+    let mut transform_channels: HashMap<String, mpsc::Sender<Event>> = HashMap::new();
+    let mut transform_receivers: HashMap<String, mpsc::Receiver<Event>> = HashMap::new();
+    if let Some(transforms) = &config.transforms {
+        for name in transforms.keys() {
+            let (tx, rx) = mpsc::channel::<Event>(DEFAULT_CHANNEL_SIZE);
+            transform_channels.insert(name.clone(), tx);
+            transform_receivers.insert(name.clone(), rx);
+        }
+    }
+
+    let mut sink_channels: HashMap<String, (mpsc::Sender<Event>, WhenFull)> = HashMap::new();
+    let mut sink_receivers: HashMap<String, mpsc::Receiver<Event>> = HashMap::new();
+    for (name, scfg) in &config.sinks {
+        let buffer: SinkBufferConfig = scfg
+            .buffer
+            .clone()
+            .unwrap_or(SinkBufferConfig {
+                max_events: DEFAULT_CHANNEL_SIZE,
+                when_full: WhenFull::Block,
+            });
+        let (tx, rx) = mpsc::channel::<Event>(buffer.max_events);
+        sink_channels.insert(name.clone(), (tx, buffer.when_full));
+        sink_receivers.insert(name.clone(), rx);
+    }
+
+    // Build downstream adjacency
+    let mut downstreams: HashMap<String, Vec<Downstream>> = HashMap::new();
+    if let Some(transforms) = &config.transforms {
+        for (name, cfg) in transforms {
+            for inp in &cfg.inputs {
+                let entry = downstreams.entry(inp.clone()).or_default();
+                if let Some(tx) = transform_channels.get(name) {
+                    entry.push(Downstream {
+                        tx: tx.clone(),
+                        mode: WhenFull::Block,
+                    });
+                }
+            }
+        }
+    }
+    for (sink_name, sink_cfg) in &config.sinks {
+        for inp in &sink_cfg.inputs {
+            let entry = downstreams.entry(inp.clone()).or_default();
+            if let Some((tx, mode)) = sink_channels.get(sink_name) {
+                entry.push(Downstream {
+                    tx: tx.clone(),
+                    mode: *mode,
+                });
+            }
+        }
+    }
+
+    // Spawn sink tasks
+    let mut sink_tasks = Vec::new();
+    for (name, scfg) in &config.sinks {
+        let sink = build_sink(name, scfg)?;
+        if let Some(rx) = sink_receivers.remove(name) {
+            sink_tasks.push(task::spawn(async move {
+                sink.run(rx).await;
+            }));
+        }
+    }
+
+    // Spawn transform tasks
+    let mut transform_tasks = Vec::new();
+    if let Some(transforms) = &config.transforms {
+        for (name, cfg) in transforms {
+            let t = build_transform(name, cfg)?;
+            if let Some(mut rx) = transform_receivers.remove(name) {
+                let downs = downstreams.get(name).cloned().unwrap_or_default();
+                transform_tasks.push(task::spawn(async move {
+                    while let Some(mut event) = rx.recv().await {
+                        if !t.apply(&mut event) {
+                            continue;
+                        }
+                        fan_out(event, &downs).await;
+                    }
+                }));
+            }
+        }
+    }
+
+    // Spawn source tasks + fanout
+    let mut source_tasks = Vec::new();
+    for (name, scfg) in &config.sources {
+        let src = build_source(name, scfg)?;
+        let downs = downstreams.get(name).cloned().unwrap_or_default();
+        let (tx, mut rx) = mpsc::channel::<Event>(DEFAULT_CHANNEL_SIZE);
+        source_tasks.push(task::spawn(async move {
+            src.run(tx).await;
+        }));
+        source_tasks.push(task::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                fan_out(event, &downs).await;
+            }
+        }));
+    }
+
+    for t in source_tasks {
+        let _ = t.await;
+    }
+    for t in transform_tasks {
+        let _ = t.await;
+    }
     for t in sink_tasks {
         let _ = t.await;
     }
