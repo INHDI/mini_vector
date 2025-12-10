@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     let file = File::open(&config_path)?;
     let config: FullConfig = serde_yaml::from_reader(file)?;
+    config.validate()?;
 
     info!("Loaded config from {:?}", config_path);
 
