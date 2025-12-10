@@ -1,25 +1,20 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::{extract::State, routing::post, Json, Router as HttpRouter};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{info, warn};
-
-use std::net::SocketAddr;
-use axum::{
-    routing::post,
-    Router as HttpRouter,
-    extract::State,
-    Json,
-};
-use serde_json::Value as JsonValue;
+use regex::Regex;
 
 /// =========================
-///  Event model
+///  HTTP Source
 /// =========================
 
 #[derive(Clone)]
@@ -38,10 +33,7 @@ impl HttpSource {
     }
 }
 
-async fn http_source_handler(
-    State(state): State<HttpSourceState>,
-    Json(body): Json<JsonValue>,
-) {
+async fn http_source_handler(State(state): State<HttpSourceState>, Json(body): Json<JsonValue>) {
     // body là JSON, ta map sang Event.fields
     let mut event = Event::new();
 
@@ -88,16 +80,16 @@ impl Source for HttpSource {
             .route(&self.path, post(http_source_handler))
             .with_state(state);
 
-            let listener = match tokio::net::TcpListener::bind(self.addr).await {
-                Ok(l) => l,
-                Err(err) => {
-                    warn!(
-                        "HttpSource: failed to bind address {}: {}",
-                        self.addr, err
-                    );
-                    return; // dừng source này, nhưng không kill cả process
-                }
-            };
+        let listener = match tokio::net::TcpListener::bind(self.addr).await {
+            Ok(l) => l,
+            Err(err) => {
+                warn!(
+                    "HttpSource: failed to bind address {}: {}",
+                    self.addr, err
+                );
+                return;
+            }
+        };
 
         if let Err(err) = axum::serve(listener, app).await {
             warn!("HttpSource error: {}", err);
@@ -106,6 +98,10 @@ impl Source for HttpSource {
         info!("HttpSource exiting");
     }
 }
+
+/// =========================
+///  Event model
+/// =========================
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
@@ -204,7 +200,6 @@ impl Source for StdinSource {
         while let Ok(Some(line)) = reader.next_line().await {
             let mut event = Event::new();
             event.insert("message", line);
-            // Ở đây có thể parse thêm timestamp, host,...
             if tx.send(event).await.is_err() {
                 warn!("StdinSource: receiver closed, stopping");
                 break;
@@ -236,7 +231,7 @@ impl Transform for AddFieldTransform {
     }
 }
 
-/// Ví dụ transform filter theo substring
+/// Filter theo substring
 pub struct ContainsFilterTransform {
     field: String,
     needle: String,
@@ -258,23 +253,47 @@ impl Transform for ContainsFilterTransform {
     }
 }
 
+/// JsonParseTransform với behavior chuẩn hóa:
+/// - drop_on_error: true => drop event khi parse lỗi
+/// - remove_source: true => xóa field nguồn (ví dụ message) sau khi parse thành công
 pub struct JsonParseTransform {
     from_field: String,
+    drop_on_error: bool,
+    remove_source: bool,
 }
 
 impl JsonParseTransform {
-    pub fn new(from_field: String) -> Self {
-        Self { from_field }
+    pub fn new(from_field: String, drop_on_error: bool, remove_source: bool) -> Self {
+        Self {
+            from_field,
+            drop_on_error,
+            remove_source,
+        }
     }
 }
 
 impl Transform for JsonParseTransform {
     fn apply(&self, event: &mut Event) -> bool {
-        // lấy chuỗi từ field cần parse
         let raw = match event.fields.get(&self.from_field) {
             Some(Value::String(s)) => s.clone(),
-            _ => return true, // không có field / không phải string -> bỏ qua
+            _ => {
+                // không có field hoặc không phải string
+                if self.drop_on_error {
+                    warn!(
+                        "JsonParseTransform: source field '{}' missing or not string, dropping event",
+                        self.from_field
+                    );
+                    return false;
+                } else {
+                    return true;
+                }
+            }
         };
+
+        if raw.trim().is_empty() {
+            // chuỗi rỗng: coi như không có dữ liệu
+            return !self.drop_on_error;
+        }
 
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(serde_json::Value::Object(map)) => {
@@ -295,6 +314,9 @@ impl Transform for JsonParseTransform {
                     };
                     event.insert(k, v);
                 }
+                if self.remove_source {
+                    event.fields.remove(&self.from_field);
+                }
                 true
             }
             _ => {
@@ -302,12 +324,249 @@ impl Transform for JsonParseTransform {
                     "JsonParseTransform: failed to parse '{}' as JSON",
                     self.from_field
                 );
-                true // giữ nguyên event
+                if self.drop_on_error {
+                    false
+                } else {
+                    true
+                }
             }
         }
     }
 }
 
+/// RegexParseTransform:
+/// - field: tên field nguồn (ví dụ: "message")
+/// - pattern: regex với named capture groups (?P<name>...)
+/// - drop_on_error: true => drop event khi không match
+/// - remove_source: true => xóa field nguồn sau khi parse thành công
+pub struct RegexParseTransform {
+    field: String,
+    regex: Regex,
+    drop_on_error: bool,
+    remove_source: bool,
+}
+
+impl RegexParseTransform {
+    pub fn new(
+        field: String,
+        pattern: String,
+        drop_on_error: bool,
+        remove_source: bool,
+    ) -> anyhow::Result<Self> {
+        let regex = Regex::new(&pattern)
+            .map_err(|e| anyhow::anyhow!("invalid regex pattern '{}': {}", pattern, e))?;
+        Ok(Self {
+            field,
+            regex,
+            drop_on_error,
+            remove_source,
+        })
+    }
+}
+
+impl Transform for RegexParseTransform {
+    fn apply(&self, event: &mut Event) -> bool {
+        let raw = match event.fields.get(&self.field) {
+            Some(Value::String(s)) => s.clone(),
+            _ => {
+                if self.drop_on_error {
+                    warn!(
+                        "RegexParseTransform: source field '{}' missing or not string, dropping event",
+                        self.field
+                    );
+                    return false;
+                } else {
+                    return true;
+                }
+            }
+        };
+
+        if raw.trim().is_empty() {
+            return !self.drop_on_error;
+        }
+
+        if let Some(caps) = self.regex.captures(&raw) {
+            // Lặp qua tất cả named groups (bỏ group 0)
+            for name in self
+                .regex
+                .capture_names()
+                .flatten()
+                .filter(|n| *n != "0")
+            {
+                if let Some(m) = caps.name(name) {
+                    event.insert(name.to_string(), m.as_str().to_string());
+                }
+            }
+
+            if self.remove_source {
+                event.fields.remove(&self.field);
+            }
+
+            true
+        } else {
+            warn!(
+                "RegexParseTransform: regex did not match field '{}' value: {}",
+                self.field, raw
+            );
+            !self.drop_on_error
+        }
+    }
+}
+
+/// NormalizeSchemaTransform: map field nguồn về schema Mini SOC
+/// Canonical keys: @timestamp, host, severity, program, message, log_type
+pub struct NormalizeSchemaTransform {
+    timestamp_field: Option<String>,
+    host_field: Option<String>,
+    severity_field: Option<String>,
+    program_field: Option<String>,
+    message_field: Option<String>,
+    default_log_type: Option<String>,
+}
+
+impl NormalizeSchemaTransform {
+    pub fn new(
+        timestamp_field: Option<String>,
+        host_field: Option<String>,
+        severity_field: Option<String>,
+        program_field: Option<String>,
+        message_field: Option<String>,
+        default_log_type: Option<String>,
+    ) -> Self {
+        Self {
+            timestamp_field,
+            host_field,
+            severity_field,
+            program_field,
+            message_field,
+            default_log_type,
+        }
+    }
+}
+
+impl Transform for NormalizeSchemaTransform {
+    fn apply(&self, event: &mut Event) -> bool {
+        if let Some(ref src) = self.timestamp_field {
+            if let Some(v) = event.fields.get(src).cloned() {
+                event.insert("@timestamp".to_string(), v);
+            }
+        }
+        if let Some(ref src) = self.host_field {
+            if let Some(v) = event.fields.get(src).cloned() {
+                event.insert("host".to_string(), v);
+            }
+        }
+        if let Some(ref src) = self.severity_field {
+            if let Some(v) = event.fields.get(src).cloned() {
+                event.insert("severity".to_string(), v);
+            }
+        }
+        if let Some(ref src) = self.program_field {
+            if let Some(v) = event.fields.get(src).cloned() {
+                event.insert("program".to_string(), v);
+            }
+        }
+        if let Some(ref src) = self.message_field {
+            if let Some(v) = event.fields.get(src).cloned() {
+                event.insert("message".to_string(), v);
+            }
+        }
+
+        // đảm bảo có log_type nếu default được cấu hình
+        if !event.fields.contains_key("log_type") {
+            if let Some(ref lt) = self.default_log_type {
+                event.insert("log_type".to_string(), Value::String(lt.clone()));
+            }
+        }
+
+        true
+    }
+}
+
+/// ScriptTransform – "mini VRL" rất đơn giản:
+/// Hỗ trợ các câu lệnh:
+///   .field = "literal"
+///   .field = .other_field
+///   .field = upcase(.other_field)
+pub struct ScriptTransform {
+    lines: Vec<String>,
+}
+
+impl ScriptTransform {
+    pub fn new(script: String) -> Self {
+        let lines = script
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        Self { lines }
+    }
+
+    fn apply_line(&self, line: &str, event: &mut Event) {
+        if !line.starts_with('.') {
+            warn!(
+                "ScriptTransform: invalid line (must start with '.'): {}",
+                line
+            );
+            return;
+        }
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            warn!("ScriptTransform: invalid assignment: {}", line);
+            return;
+        }
+        let left = parts[0].trim();
+        let right = parts[1].trim();
+
+        if !left.starts_with('.') {
+            warn!("ScriptTransform: invalid left side: {}", line);
+            return;
+        }
+        let field_name = &left[1..];
+
+        // .field = "literal"
+        if right.starts_with('"') && right.ends_with('"') && right.len() >= 2 {
+            let inner = &right[1..right.len() - 1];
+            event.insert(field_name.to_string(), Value::String(inner.to_string()));
+            return;
+        }
+
+        // .field = .other_field
+        if right.starts_with('.') {
+            let src = &right[1..];
+            if let Some(v) = event.fields.get(src).cloned() {
+                event.insert(field_name.to_string(), v);
+            } else {
+                event.insert(field_name.to_string(), Value::String(String::new()));
+            }
+            return;
+        }
+
+        // .field = upcase(.other_field)
+        if right.starts_with("upcase(") && right.ends_with(')') {
+            let inner = &right["upcase(".len()..right.len() - 1];
+            let inner = inner.trim();
+            if inner.starts_with('.') {
+                let src = &inner[1..];
+                if let Some(Value::String(s)) = event.fields.get(src) {
+                    event.insert(field_name.to_string(), Value::String(s.to_uppercase()));
+                }
+            }
+            return;
+        }
+
+        warn!("ScriptTransform: unsupported expression: {}", line);
+    }
+}
+
+impl Transform for ScriptTransform {
+    fn apply(&self, event: &mut Event) -> bool {
+        for line in &self.lines {
+            self.apply_line(line, event);
+        }
+        true
+    }
+}
 
 /// =========================
 ///  Implementations: Sinks
@@ -333,22 +592,16 @@ impl HttpSink {
     }
 }
 
-
 #[async_trait]
 impl Sink for HttpSink {
     async fn run(self: Box<Self>, mut rx: mpsc::Receiver<Event>) {
         info!("HttpSink[{}] started, endpoint={}", self.name, self.endpoint);
 
         while let Some(event) = rx.recv().await {
-            // Đơn giản: gửi từng event một (sau này có thể batch)
-            let body = serde_json::to_value(&event).unwrap_or_else(|_| serde_json::json!({}));
+            let body =
+                serde_json::to_value(&event).unwrap_or_else(|_| serde_json::json!({}));
 
-            let res = self
-                .client
-                .post(&self.endpoint)
-                .json(&body)
-                .send()
-                .await;
+            let res = self.client.post(&self.endpoint).json(&body).send().await;
 
             match res {
                 Ok(r) => {
@@ -381,7 +634,11 @@ impl Sink for ConsoleSink {
     async fn run(self: Box<Self>, mut rx: mpsc::Receiver<Event>) {
         info!("ConsoleSink[{}] started", self.name);
         while let Some(event) = rx.recv().await {
-            println!("[sink:{}] {}", self.name, serde_json::to_string(&event).unwrap());
+            println!(
+                "[sink:{}] {}",
+                self.name,
+                serde_json::to_string(&event).unwrap()
+            );
         }
         info!("ConsoleSink[{}] exiting", self.name);
     }
@@ -443,7 +700,7 @@ pub struct SourceConfig {
     #[serde(default)]
     pub address: Option<String>, // "0.0.0.0:9000"
     #[serde(default)]
-    pub path: Option<String>,    // "/ingest"
+    pub path: Option<String>, // "/ingest"
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,15 +708,40 @@ pub struct TransformConfig {
     #[serde(rename = "type")]
     pub kind: String,
 
-    // cho add_field
+    // add_field / contains_filter / json_parse
     #[serde(default)]
     pub field: Option<String>,
     #[serde(default)]
     pub value: Option<String>,
-
-    // cho contains_filter
     #[serde(default)]
     pub needle: Option<String>,
+
+    // json_parse options
+    #[serde(default)]
+    pub drop_on_error: Option<bool>,
+    #[serde(default)]
+    pub remove_source: Option<bool>,
+
+    // normalize_schema options
+    #[serde(default)]
+    pub timestamp_field: Option<String>,
+    #[serde(default)]
+    pub host_field: Option<String>,
+    #[serde(default)]
+    pub severity_field: Option<String>,
+    #[serde(default)]
+    pub program_field: Option<String>,
+    #[serde(default)]
+    pub message_field: Option<String>,
+    #[serde(default)]
+    pub default_log_type: Option<String>,
+
+    // script transform
+    #[serde(default)]
+    pub script: Option<String>,
+
+    #[serde(default)]
+    pub pattern: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -499,9 +781,14 @@ fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source
                 .clone()
                 .unwrap_or_else(|| "/ingest".to_string());
 
-            let addr: SocketAddr = addr_str
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid address '{}' for source '{}': {}", addr_str, name, e))?;
+            let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid address '{}' for source '{}': {}",
+                    addr_str,
+                    name,
+                    e
+                )
+            })?;
 
             Ok(Box::new(HttpSource::new(addr, path)))
         }
@@ -520,7 +807,10 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .value
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'value'", name))?;
-            Ok(Box::new(AddFieldTransform::new(field, Value::from(value))))
+            Ok(Box::new(AddFieldTransform::new(
+                field,
+                Value::from(value),
+            )))
         }
         "contains_filter" => {
             let field = cfg
@@ -538,12 +828,50 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .field
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' (json_parse) missing 'field'", name))?;
-            Ok(Box::new(JsonParseTransform::new(field)))
+            let drop_on_error = cfg.drop_on_error.unwrap_or(false);
+            let remove_source = cfg.remove_source.unwrap_or(false);
+            Ok(Box::new(JsonParseTransform::new(
+                field,
+                drop_on_error,
+                remove_source,
+            )))
+        }
+        "normalize_schema" => {
+            Ok(Box::new(NormalizeSchemaTransform::new(
+                cfg.timestamp_field.clone(),
+                cfg.host_field.clone(),
+                cfg.severity_field.clone(),
+                cfg.program_field.clone(),
+                cfg.message_field.clone(),
+                cfg.default_log_type.clone(),
+            )))
+        }
+        "script" => {
+            let script = cfg
+                .script
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (script) missing 'script'", name))?;
+            Ok(Box::new(ScriptTransform::new(script)))
+        }
+        "regex_parse" => {
+            let field = cfg
+                .field
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (regex_parse) missing 'field'", name))?;
+            let pattern = cfg
+                .pattern
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (regex_parse) missing 'pattern'", name))?;
+
+            let drop_on_error = cfg.drop_on_error.unwrap_or(false);
+            let remove_source = cfg.remove_source.unwrap_or(false);
+
+            let t = RegexParseTransform::new(field, pattern, drop_on_error, remove_source)?;
+            Ok(Box::new(t))
         }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
     }
 }
-
 
 fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
     match cfg.kind.as_str() {
@@ -553,7 +881,10 @@ fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
                 .endpoint
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("sink '{}' (http) missing 'endpoint'", name))?;
-            Ok(Box::new(HttpSink::new(name.to_string(), endpoint)))
+            Ok(Box::new(HttpSink::new(
+                name.to_string(),
+                endpoint,
+            )))
         }
         other => anyhow::bail!("Unknown sink type '{}' for '{}'", other, name),
     }
@@ -578,7 +909,7 @@ async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
     }
     drop(ingress_tx); // channel sẽ đóng khi các source kết thúc
 
-    // 3. Build transforms (theo thứ tự định nghĩa trong file – hoặc anh có thể thêm trường "order")
+    // 3. Build transforms
     let mut transforms: Vec<Arc<dyn Transform>> = Vec::new();
     if let Some(tcfgs) = &config.transforms {
         for (name, tcfg) in tcfgs {
@@ -636,13 +967,11 @@ async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
                 // route đến các sink
                 let targets = router.route(&event);
                 if targets.is_empty() {
-                    // có thể log warning hoặc bỏ
                     continue;
                 }
 
                 for sink_id in targets {
                     if let Some(tx) = sink_senders.get(&sink_id) {
-                        // clone event vì có thể gửi nhiều sink
                         if tx.send(event.clone()).await.is_err() {
                             warn!("Sink '{}' seems closed", sink_id);
                         }
@@ -673,7 +1002,6 @@ async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // logging
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .init();
