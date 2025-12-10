@@ -1,0 +1,29 @@
+# mini_vector.yml
+sources:
+  stdin:
+    type: stdin
+
+transforms:
+  add_type:
+    type: add_field
+    field: log_type
+    value: linux_syslog
+
+  only_warn:
+    type: contains_filter
+    field: message
+    needle: "warn"
+
+router:
+  field: log_type
+  routes:
+    - equals: linux_syslog
+      sink: console_warn
+    # có thể thêm route khác cho log_type khác
+
+sinks:
+  console_warn:
+    type: console
+  # thêm một sink nữa nếu muốn:
+  # console_all:
+  #   type: console
