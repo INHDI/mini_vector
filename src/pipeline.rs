@@ -285,6 +285,10 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
         return run_pipeline_linear(config).await;
     }
 
+    if config.router.is_some() {
+        warn!("router config present but ignored because inputs topology is enabled");
+    }
+
     // Build channels for transforms and sinks
     let mut transform_channels: HashMap<String, mpsc::Sender<Event>> = HashMap::new();
     let mut transform_receivers: HashMap<String, mpsc::Receiver<Event>> = HashMap::new();

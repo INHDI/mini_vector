@@ -130,8 +130,7 @@ impl FullConfig {
             }
         }
 
-        let mut node_names: HashSet<String> =
-            self.sources.keys().cloned().collect();
+        let mut node_names: HashSet<String> = self.sources.keys().cloned().collect();
         if let Some(transforms) = &self.transforms {
             node_names.extend(transforms.keys().cloned());
         }
@@ -196,7 +195,7 @@ impl FullConfig {
 
         if has_inputs {
             if let Some(transforms) = &self.transforms {
-                for (name, t) in transforms {
+                for (_name, t) in transforms {
                     if t.inputs.is_empty() {
                         anyhow::bail!("transform '{}' uses inputs mode but 'inputs' is empty", name);
                     }
@@ -217,6 +216,78 @@ impl FullConfig {
                         anyhow::bail!("sink '{}' input '{}' not found", sink_name, inp);
                     }
                 }
+            }
+        }
+
+        // Validate sink buffers
+        for (sink_name, sink_cfg) in &self.sinks {
+            if let Some(buf) = &sink_cfg.buffer {
+                if buf.max_events == 0 {
+                    anyhow::bail!("sink '{}' buffer.max_events must be > 0", sink_name);
+                }
+            }
+        }
+
+        // Detect orphan nodes (no downstream) when using inputs
+        if has_inputs {
+            let mut has_downstream: HashSet<String> = HashSet::new();
+            if let Some(transforms) = &self.transforms {
+                for (name, t) in transforms {
+                    for inp in &t.inputs {
+                        has_downstream.insert(inp.clone());
+                    }
+                }
+            }
+            for (_, sink_cfg) in &self.sinks {
+                for inp in &sink_cfg.inputs {
+                    has_downstream.insert(inp.clone());
+                }
+            }
+            for source in self.sources.keys() {
+                if !has_downstream.contains(source) {
+                    anyhow::bail!("source '{}' has no downstream in inputs topology", source);
+                }
+            }
+        }
+
+        // Detect cycles with DFS
+        if has_inputs {
+            let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+            if let Some(transforms) = &self.transforms {
+                for (name, t) in transforms {
+                    graph.insert(name.clone(), t.inputs.clone());
+                }
+            }
+            for (sink_name, sink_cfg) in &self.sinks {
+                graph.insert(format!("sink:{}", sink_name), sink_cfg.inputs.clone());
+            }
+
+            fn dfs(
+                node: &str,
+                graph: &HashMap<String, Vec<String>>,
+                visiting: &mut HashSet<String>,
+                visited: &mut HashSet<String>,
+            ) -> anyhow::Result<()> {
+                if visited.contains(node) {
+                    return Ok(());
+                }
+                if !visiting.insert(node.to_string()) {
+                    anyhow::bail!("cycle detected at node '{}'", node);
+                }
+                if let Some(neigh) = graph.get(node) {
+                    for n in neigh {
+                        dfs(n, graph, visiting, visited)?;
+                    }
+                }
+                visiting.remove(node);
+                visited.insert(node.to_string());
+                Ok(())
+            }
+
+            let mut visiting = HashSet::new();
+            let mut visited = HashSet::new();
+            for node in graph.keys() {
+                dfs(node, &graph, &mut visiting, &mut visited)?;
             }
         }
 
