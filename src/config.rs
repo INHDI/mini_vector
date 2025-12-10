@@ -55,6 +55,9 @@ pub struct TransformConfig {
 
     #[serde(default)]
     pub pattern: Option<String>,
+
+    #[serde(default)]
+    pub target_prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
