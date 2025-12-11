@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio::task;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::config::{
     FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig, WhenFull,
 };
 use crate::event::{Event, Value};
-use crate::router::{EventRouter, RouterConfig};
+// Router is deprecated in DAG mode, but we might keep it for legacy compat if we wanted to map it to a "RouterTransform"
+// use crate::router::{EventRouter, RouterConfig};
 use crate::sinks::console::ConsoleSink;
 use crate::sinks::http::HttpSink;
 use crate::sinks::Sink;
@@ -57,6 +57,7 @@ fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source
 }
 
 fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn Transform>> {
+    let name_owned = name.to_string();
     match cfg.kind.as_str() {
         "add_field" => {
             let field = cfg
@@ -68,6 +69,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'value'", name))?;
             Ok(Box::new(AddFieldTransform::new(
+                name_owned,
                 field,
                 Value::from(value),
             )))
@@ -81,7 +83,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .needle
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'needle'", name))?;
-            Ok(Box::new(ContainsFilterTransform::new(field, needle)))
+            Ok(Box::new(ContainsFilterTransform::new(name_owned, field, needle)))
         }
         "json_parse" => {
             let field = cfg
@@ -92,6 +94,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
             let remove_source = cfg.remove_source.unwrap_or(false);
             let target_prefix = cfg.target_prefix.clone();
             Ok(Box::new(JsonParseTransform::new(
+                name_owned,
                 field,
                 drop_on_error,
                 remove_source,
@@ -100,6 +103,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
         }
         "normalize_schema" => {
             Ok(Box::new(NormalizeSchemaTransform::new(
+                name_owned,
                 cfg.timestamp_field.clone(),
                 cfg.host_field.clone(),
                 cfg.severity_field.clone(),
@@ -113,7 +117,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .script
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' (script) missing 'script'", name))?;
-            let t = ScriptTransform::compile(script)?;
+            let t = ScriptTransform::compile(name_owned, script)?;
             Ok(Box::new(t))
         }
         "regex_parse" => {
@@ -130,7 +134,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
             let remove_source = cfg.remove_source.unwrap_or(false);
             let target_prefix = cfg.target_prefix.clone();
 
-            let t = RegexParseTransform::new(field, pattern, drop_on_error, remove_source, target_prefix)?;
+            let t = RegexParseTransform::new(name_owned, field, pattern, drop_on_error, remove_source, target_prefix)?;
             Ok(Box::new(t))
         }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
@@ -177,118 +181,11 @@ async fn fan_out(event: Event, downstreams: &[Downstream]) {
     }
 }
 
-async fn run_pipeline_linear(config: FullConfig) -> anyhow::Result<()> {
-    let (ingress_tx, mut ingress_rx) = mpsc::channel::<Event>(1024);
-
-    let mut source_tasks = Vec::new();
-    for (name, scfg) in &config.sources {
-        let src = build_source(name, scfg)?;
-        let tx = ingress_tx.clone();
-        source_tasks.push(task::spawn(async move {
-            src.run(tx).await;
-        }));
-    }
-    drop(ingress_tx);
-
-    let mut transforms: Vec<Arc<dyn Transform>> = Vec::new();
-    if let Some(tcfgs) = &config.transforms {
-        for (name, tcfg) in tcfgs {
-            let t = build_transform(name, tcfg)?;
-            transforms.push(Arc::from(t));
-        }
-    }
-
-    let router = config
-        .router
-        .map(EventRouter::new)
-        .unwrap_or_else(|| EventRouter::new(RouterConfig {
-            field: "log_type".to_string(),
-            routes: Vec::new(),
-        }));
-
-    let mut sink_senders: HashMap<String, mpsc::Sender<Event>> = HashMap::new();
-    let mut sink_tasks = Vec::new();
-
-    for (name, scfg) in &config.sinks {
-        let sink = build_sink(name, scfg)?;
-        let (tx, rx) = mpsc::channel::<Event>(1024);
-        sink_senders.insert(name.clone(), tx);
-        sink_tasks.push(task::spawn(async move {
-            sink.run(rx).await;
-        }));
-    }
-
-    let router = Arc::new(router);
-    let sink_senders = Arc::new(sink_senders);
-    let transforms = Arc::new(transforms);
-
-    let pipeline_task = {
-        let router = router.clone();
-        let sink_senders = sink_senders.clone();
-        let transforms = transforms.clone();
-
-        task::spawn(async move {
-            while let Some(mut event) = ingress_rx.recv().await {
-                let mut keep = true;
-                for t in transforms.iter() {
-                    if !t.apply(&mut event) {
-                        keep = false;
-                        break;
-                    }
-                }
-                if !keep {
-                    continue;
-                }
-
-                let targets = router.route(&event);
-                if targets.is_empty() {
-                    continue;
-                }
-
-                for sink_id in targets {
-                    if let Some(tx) = sink_senders.get(&sink_id) {
-                        if tx.send(event.clone()).await.is_err() {
-                            warn!("Sink '{}' seems closed", sink_id);
-                        }
-                    } else {
-                        warn!("No sink named '{}' in routing", sink_id);
-                    }
-                }
-            }
-            info!("Pipeline main loop exiting (no more events)");
-        })
-    };
-
-    for t in source_tasks {
-        let _ = t.await;
-    }
-    let _ = pipeline_task.await;
-    for t in sink_tasks {
-        let _ = t.await;
-    }
-
-    Ok(())
-}
-
 pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
-    let has_inputs = config
-        .transforms
-        .as_ref()
-        .map(|t| t.values().any(|cfg| !cfg.inputs.is_empty()))
-        .unwrap_or(false)
-        || config
-            .sinks
-            .values()
-            .any(|cfg| !cfg.inputs.is_empty());
-
-    if !has_inputs {
-        return run_pipeline_linear(config).await;
-    }
-
-    if config.router.is_some() {
-        warn!("router config present but ignored because inputs topology is enabled");
-    }
-
+    // If no inputs are defined, we technically have a disconnected graph,
+    // but we proceed anyway (maybe only sources running).
+    // The previous run_pipeline_linear is removed as it's incompatible with async Transform::run.
+    
     // Build channels for transforms and sinks
     let mut transform_channels: HashMap<String, mpsc::Sender<Event>> = HashMap::new();
     let mut transform_receivers: HashMap<String, mpsc::Receiver<Event>> = HashMap::new();
@@ -358,14 +255,20 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
     if let Some(transforms) = &config.transforms {
         for (name, cfg) in transforms {
             let t = build_transform(name, cfg)?;
-            if let Some(mut rx) = transform_receivers.remove(name) {
+            if let Some(rx) = transform_receivers.remove(name) {
                 let downs = downstreams.get(name).cloned().unwrap_or_default();
+                
+                // Create intermediate channel for Transform output -> FanOut
+                let (tx_out, mut rx_out) = mpsc::channel::<Event>(DEFAULT_CHANNEL_SIZE);
+                
                 transform_tasks.push(task::spawn(async move {
-                    while let Some(mut event) = rx.recv().await {
-                        if !t.apply(&mut event) {
-                            continue;
-                        }
-                        fan_out(event, &downs).await;
+                    t.run(rx, tx_out).await;
+                }));
+
+                // FanOut task
+                transform_tasks.push(task::spawn(async move {
+                    while let Some(event) = rx_out.recv().await {
+                         fan_out(event, &downs).await;
                     }
                 }));
             }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
@@ -12,39 +12,71 @@ pub enum Value {
     Bool(bool),
     Timestamp(DateTime<Utc>),
     Array(Vec<Value>),
-    Object(HashMap<String, Value>),
+    Object(BTreeMap<String, Value>),
     Bytes(Vec<u8>),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Event {
-    pub fields: HashMap<String, Value>,
+pub struct LogEvent {
+    pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum Event {
+    Log(LogEvent),
+    // Metric(MetricEvent),
+    // Trace(TraceEvent),
 }
 
 impl Event {
+    pub fn new_log() -> Self {
+        Event::Log(LogEvent {
+            fields: BTreeMap::new(),
+        })
+    }
+
+    /// Convenience for legacy code: creates a new Log event
     pub fn new() -> Self {
-        Self {
-            fields: HashMap::new(),
-        }
+        Self::new_log()
     }
 
     pub fn insert<S: Into<String>, V: Into<Value>>(&mut self, key: S, value: V) {
-        self.fields.insert(key.into(), value.into());
+        let Event::Log(log) = self;
+        log.fields.insert(key.into(), value.into());
     }
 
     pub fn get_str(&self, key: &str) -> Option<&str> {
-        match self.fields.get(key) {
-            Some(Value::String(s)) => Some(s.as_str()),
-            _ => None,
+        match self {
+            Event::Log(log) => match log.fields.get(key) {
+                Some(Value::String(s)) => Some(s.as_str()),
+                _ => None,
+            },
         }
     }
 
     #[allow(dead_code)]
     pub fn get_timestamp(&self, key: &str) -> Option<DateTime<Utc>> {
-        match self.fields.get(key) {
-            Some(Value::Timestamp(ts)) => Some(*ts),
-            Some(Value::String(s)) => parse_timestamp(s),
-            _ => None,
+        match self {
+            Event::Log(log) => match log.fields.get(key) {
+                Some(Value::Timestamp(ts)) => Some(*ts),
+                Some(Value::String(s)) => parse_timestamp(s),
+                _ => None,
+            },
+        }
+    }
+    
+    #[allow(dead_code)]
+    pub fn as_log(&self) -> Option<&LogEvent> {
+        match self {
+            Event::Log(l) => Some(l),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn as_log_mut(&mut self) -> Option<&mut LogEvent> {
+        match self {
+            Event::Log(l) => Some(l),
         }
     }
 }
@@ -113,7 +145,7 @@ pub fn value_from_json(v: &serde_json::Value) -> Value {
             Value::Array(arr.iter().map(value_from_json).collect())
         }
         serde_json::Value::Object(map) => {
-            let mut out = HashMap::new();
+            let mut out = BTreeMap::new();
             for (k, v) in map {
                 out.insert(k.clone(), value_from_json(v));
             }

@@ -18,3 +18,5 @@ axum = { version = "0.8.7", features = ["json"] }
 regex = "1.12.2"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 indexmap = { version = "2", features = ["serde"] }
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"

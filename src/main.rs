@@ -1,7 +1,6 @@
 mod config;
 mod event;
 mod pipeline;
-mod router;
 mod sinks;
 mod sources;
 mod transforms;
@@ -9,7 +8,7 @@ mod transforms;
 use std::fs::File;
 use std::path::PathBuf;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::FullConfig;
 use crate::pipeline::run_pipeline;
@@ -19,6 +18,16 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .init();
+
+    // Initialize Prometheus metrics (listen on port 9100 by default for scraping)
+    // We catch the error in case the port is busy, but we don't crash the app (maybe just log warning)
+    match metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(([0, 0, 0, 0], 9100))
+        .install()
+    {
+        Ok(_) => info!("Prometheus metrics listening on 0.0.0.0:9100"),
+        Err(e) => warn!("Failed to install Prometheus recorder: {}", e),
+    }
 
     let config_path = std::env::args()
         .nth(1)

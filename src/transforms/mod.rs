@@ -1,3 +1,6 @@
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+
 use crate::event::Event;
 
 pub mod add_field;
@@ -7,7 +10,7 @@ pub mod normalize_schema;
 pub mod regex_parse;
 pub mod script;
 
-/// Returns false if the event should be dropped.
+#[async_trait]
 pub trait Transform: Send + Sync {
-    fn apply(&self, event: &mut Event) -> bool;
+    async fn run(self: Box<Self>, input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>);
 }

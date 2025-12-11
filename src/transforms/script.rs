@@ -1,13 +1,10 @@
 use anyhow::Result;
+use async_trait::async_trait;
+use tokio::sync::mpsc;
 use crate::event::{Event, Value};
 use crate::transforms::Transform;
 
-/// ScriptTransform – "mini VRL" rất đơn giản:
-/// Hỗ trợ các câu lệnh:
-///   .field = "literal"
-///   .field = .other_field
-///   .field = upcase(.other_field)
-///   drop()
+/// ScriptTransform – "mini VRL" rất đơn giản
 #[derive(Debug, Clone)]
 pub enum ScriptOp {
     AssignLiteral { field: String, value: String },
@@ -17,11 +14,12 @@ pub enum ScriptOp {
 }
 
 pub struct ScriptTransform {
+    pub name: String,
     pub ops: Vec<ScriptOp>,
 }
 
 impl ScriptTransform {
-    pub fn compile(script: String) -> Result<Self> {
+    pub fn compile(name: String, script: String) -> Result<Self> {
         let mut ops = Vec::new();
         for raw_line in script.lines() {
             let line = raw_line.trim();
@@ -87,26 +85,30 @@ impl ScriptTransform {
             anyhow::bail!("unsupported expression: {}", line);
         }
 
-        Ok(Self { ops })
+        Ok(Self { name, ops })
     }
 
     fn apply_op(&self, op: &ScriptOp, event: &mut Event) -> bool {
+        let log = match event {
+            Event::Log(l) => l,
+        };
+
         match op {
             ScriptOp::AssignLiteral { field, value } => {
-                event.insert(field.clone(), Value::String(value.clone()));
+                log.fields.insert(field.clone(), Value::String(value.clone()));
                 true
             }
             ScriptOp::AssignField { field, src } => {
-                if let Some(v) = event.fields.get(src).cloned() {
-                    event.insert(field.clone(), v);
+                if let Some(v) = log.fields.get(src).cloned() {
+                    log.fields.insert(field.clone(), v);
                 } else {
-                    event.insert(field.clone(), Value::String(String::new()));
+                    log.fields.insert(field.clone(), Value::String(String::new()));
                 }
                 true
             }
             ScriptOp::UpcaseField { field, src } => {
-                if let Some(Value::String(s)) = event.fields.get(src) {
-                    event.insert(field.clone(), Value::String(s.to_uppercase()));
+                if let Some(Value::String(s)) = log.fields.get(src) {
+                    log.fields.insert(field.clone(), Value::String(s.to_uppercase()));
                 }
                 true
             }
@@ -115,14 +117,27 @@ impl ScriptTransform {
     }
 }
 
+#[async_trait]
 impl Transform for ScriptTransform {
-    fn apply(&self, event: &mut Event) -> bool {
-        for op in &self.ops {
-            if !self.apply_op(op, event) {
-                return false;
+    async fn run(self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
+        while let Some(mut event) = input.recv().await {
+            metrics::increment_counter!("events_in", "component" => self.name.clone());
+            
+            let mut keep = true;
+            for op in &self.ops {
+                if !self.apply_op(op, &mut event) {
+                    keep = false;
+                    break;
+                }
+            }
+
+            if keep {
+                 if output.send(event).await.is_err() { break; }
+                 metrics::increment_counter!("events_out", "component" => self.name.clone());
+            } else {
+                 metrics::increment_counter!("events_dropped", "component" => self.name.clone());
             }
         }
-        true
     }
 }
 
@@ -130,45 +145,59 @@ impl Transform for ScriptTransform {
 mod tests {
     use super::*;
 
-    #[test]
-    fn compiles_and_applies_ops() {
+    #[tokio::test]
+    async fn compiles_and_applies_ops() {
         let script = r#"
         .soc_tenant = "tenant01"
         .sev_up = upcase(.severity)
         "#;
-        let t = ScriptTransform::compile(script.to_string()).unwrap();
+        let t = ScriptTransform::compile("test".into(), script.to_string()).unwrap();
         let mut event = Event::new();
         event.insert("severity", "warn");
-        let keep = t.apply(&mut event);
-        assert!(keep);
+        
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        
+        let event = rx_out.recv().await.expect("should output event");
+        let log = event.as_log().unwrap();
+
         assert_eq!(
-            event.fields.get("soc_tenant"),
+            log.fields.get("soc_tenant"),
             Some(&Value::String("tenant01".to_string()))
         );
         assert_eq!(
-            event.fields.get("sev_up"),
+            log.fields.get("sev_up"),
             Some(&Value::String("WARN".to_string()))
         );
     }
 
-    #[test]
-    fn drop_function_stops_event() {
+    #[tokio::test]
+    async fn drop_function_stops_event() {
         let script = r#"
         .x = "1"
         drop()
         .y = "2"
         "#;
-        let t = ScriptTransform::compile(script.to_string()).unwrap();
-        let mut event = Event::new();
-        let keep = t.apply(&mut event);
-        assert!(!keep);
-        assert!(event.fields.get("x").is_some());
-        assert!(event.fields.get("y").is_none());
+        let t = ScriptTransform::compile("test".into(), script.to_string()).unwrap();
+        let event = Event::new();
+        
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        
+        assert!(rx_out.recv().await.is_none());
     }
 
     #[test]
     fn invalid_script_fails_compile() {
         let script = ".bad upcase(\"x\")".to_string();
-        assert!(ScriptTransform::compile(script).is_err());
+        assert!(ScriptTransform::compile("test".into(), script).is_err());
     }
 }

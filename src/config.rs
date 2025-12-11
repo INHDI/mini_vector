@@ -3,8 +3,6 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::router::RouterConfig;
-
 #[derive(Debug, Deserialize)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
@@ -106,7 +104,6 @@ impl Default for WhenFull {
 pub struct FullConfig {
     pub sources: HashMap<String, SourceConfig>,
     pub transforms: Option<IndexMap<String, TransformConfig>>,
-    pub router: Option<RouterConfig>,
     pub sinks: HashMap<String, SinkConfig>,
 }
 
@@ -117,17 +114,6 @@ impl FullConfig {
         }
         if self.sinks.is_empty() {
             anyhow::bail!("config must contain at least one sink");
-        }
-
-        if let Some(router) = &self.router {
-            if router.field.trim().is_empty() {
-                anyhow::bail!("router.field cannot be empty");
-            }
-            for route in &router.routes {
-                if !self.sinks.contains_key(&route.sink) {
-                    anyhow::bail!("router route sink '{}' not defined in sinks", route.sink);
-                }
-            }
         }
 
         let mut node_names: HashSet<String> = self.sources.keys().cloned().collect();
@@ -195,7 +181,7 @@ impl FullConfig {
 
         if has_inputs {
             if let Some(transforms) = &self.transforms {
-                for (_name, t) in transforms {
+                for (name, t) in transforms {
                     if t.inputs.is_empty() {
                         anyhow::bail!("transform '{}' uses inputs mode but 'inputs' is empty", name);
                     }
@@ -232,7 +218,7 @@ impl FullConfig {
         if has_inputs {
             let mut has_downstream: HashSet<String> = HashSet::new();
             if let Some(transforms) = &self.transforms {
-                for (name, t) in transforms {
+                for (_, t) in transforms {
                     for inp in &t.inputs {
                         has_downstream.insert(inp.clone());
                     }
