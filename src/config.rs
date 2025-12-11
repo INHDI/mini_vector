@@ -91,6 +91,8 @@ pub struct SinkConfig {
     pub auth: Option<OpenSearchAuthConfig>,
     #[serde(default)]
     pub tls: Option<OpenSearchTlsConfig>,
+    #[serde(default)]
+    pub retry: Option<OpenSearchRetryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,6 +136,23 @@ pub struct OpenSearchTlsConfig {
 
 fn default_verify_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenSearchRetryConfig {
+    #[serde(default = "default_retry_attempts")]
+    pub attempts: u32,
+    #[serde(default = "default_retry_backoff_secs")]
+    pub backoff_secs: u64,
+    #[serde(default = "default_retry_backoff_secs")]
+    pub max_backoff_secs: u64,
+}
+
+fn default_retry_attempts() -> u32 {
+    3
+}
+fn default_retry_backoff_secs() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +315,18 @@ impl FullConfig {
                     .ok_or_else(|| anyhow::anyhow!("sink '{}' (opensearch) missing bulk config", sink_name))?;
                 if bulk.index.trim().is_empty() {
                     anyhow::bail!("sink '{}' (opensearch) bulk.index cannot be empty", sink_name);
+                }
+
+                if let Some(retry) = &sink_cfg.retry {
+                    if retry.attempts == 0 {
+                        anyhow::bail!("sink '{}' (opensearch) retry.attempts must be >= 1", sink_name);
+                    }
+                    if retry.backoff_secs == 0 {
+                        anyhow::bail!("sink '{}' (opensearch) retry.backoff_secs must be >= 1", sink_name);
+                    }
+                    if retry.max_backoff_secs < retry.backoff_secs {
+                        anyhow::bail!("sink '{}' (opensearch) retry.max_backoff_secs must be >= backoff_secs", sink_name);
+                    }
                 }
             }
         }

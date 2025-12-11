@@ -173,6 +173,7 @@ fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
                 cfg.auth.clone(),
                 cfg.tls.clone(),
                 cfg.batch.clone(),
+                cfg.retry.clone(),
             )?;
             Ok(Box::new(sink))
         }

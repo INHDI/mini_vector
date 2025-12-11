@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::batcher::Batcher;
-use crate::config::{BatchConfig, OpenSearchAuthConfig, OpenSearchBulkConfig, OpenSearchTlsConfig};
+use crate::config::{
+    BatchConfig, OpenSearchAuthConfig, OpenSearchBulkConfig, OpenSearchRetryConfig, OpenSearchTlsConfig,
+};
 use crate::event::{Event, Value};
 use crate::sinks::Sink;
 
@@ -19,6 +21,7 @@ pub struct OpenSearchSink {
     pub auth: Option<OpenSearchAuthConfig>,
     pub _tls: Option<OpenSearchTlsConfig>, // used during client build
     pub batch_config: Option<BatchConfig>,
+    pub retry: OpenSearchRetryConfig,
     pub client: Client,
 }
 
@@ -31,6 +34,7 @@ impl OpenSearchSink {
         auth: Option<OpenSearchAuthConfig>,
         tls: Option<OpenSearchTlsConfig>,
         batch_config: Option<BatchConfig>,
+        retry: Option<OpenSearchRetryConfig>,
     ) -> anyhow::Result<Self> {
         let mut builder = reqwest::ClientBuilder::new();
 
@@ -53,6 +57,11 @@ impl OpenSearchSink {
             auth,
             _tls: tls,
             batch_config,
+            retry: retry.unwrap_or_else(|| OpenSearchRetryConfig {
+                attempts: 3,
+                backoff_secs: 1,
+                max_backoff_secs: 3,
+            }),
             client,
         })
     }
@@ -130,28 +139,50 @@ impl OpenSearchSink {
             }
         }
 
-        let res = req.body(body).send().await;
-        match res {
-            Ok(r) => {
-                if !r.status().is_success() {
-                    warn!(
-                        "OpenSearchSink[{}] status={} for bulk request",
-                        self.name,
-                        r.status()
-                    );
-                } else if let Ok(txt) = r.text().await {
-                    // naive check for errors flag
-                    if txt.contains(r#""errors":true"#) {
-                        warn!("OpenSearchSink[{}] bulk response has errors", self.name);
+        let mut attempt = 0;
+        let mut backoff = self.retry.backoff_secs;
+        loop {
+            attempt += 1;
+            let res = req.try_clone().unwrap().body(body.clone()).send().await;
+            let mut should_retry = false;
+
+            match res {
+                Ok(r) => {
+                    let status_ok = r.status().is_success();
+                    let status_code = r.status();
+                    let txt = r.text().await.unwrap_or_else(|_| "".to_string());
+                    let has_errors = txt.contains(r#""errors":true"#);
+                    if !status_ok || has_errors {
+                        warn!(
+                            "OpenSearchSink[{}] bulk status={} errors_flag={} attempt={}/{}",
+                            self.name,
+                            status_code,
+                            has_errors,
+                            attempt,
+                            self.retry.attempts
+                        );
+                        should_retry = attempt < self.retry.attempts;
                     }
                 }
+                Err(err) => {
+                    warn!(
+                        "OpenSearchSink[{}] error sending bulk attempt={}/{}: {}",
+                        self.name,
+                        attempt,
+                        self.retry.attempts,
+                        err
+                    );
+                    should_retry = attempt < self.retry.attempts;
+                }
             }
-            Err(err) => {
-                warn!(
-                    "OpenSearchSink[{}] error sending bulk of events: {}",
-                    self.name, err
-                );
+
+            if should_retry {
+                let sleep_dur = std::time::Duration::from_secs(backoff);
+                tokio::time::sleep(sleep_dur).await;
+                backoff = (backoff * 2).min(self.retry.max_backoff_secs);
+                continue;
             }
+            break;
         }
     }
 }

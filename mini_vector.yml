@@ -1,58 +1,113 @@
 sources:
-  http_in:
+  linux_syslog_http:
     type: http
-    address: "0.0.0.0:8000"   # Lắng nghe mọi IP trên port 8000
+    address: "0.0.0.0:8000"
     path: "/"                 # Hỗ trợ JSON array, NDJSON, gzip
-    
 
 transforms:
-  # 1) Parse syslog text trong field message
-  parse_syslog:
-    type: regex_parse
-    inputs:
-      - http_in
-    field: message
-    pattern: '^(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<program>[^\[:]+)(?:\[\d+\])?:\s+(?P<severity>\w+)?\s*(?P<message>.*)$'
-    drop_on_error: false         # nếu không khớp regex thì vẫn giữ event
-    remove_source: false         # giữ lại message raw
-
-  # 2) Chuẩn hóa về schema Mini SOC
-  normalize:
-    type: normalize_schema
-    inputs:
-      - parse_syslog
-    timestamp_field: timestamp   # -> @timestamp
-    host_field: host             # -> host
-    severity_field: severity     # -> severity
-    program_field: program       # -> program
-    message_field: message       # -> message
-    default_log_type: linux_syslog
-
-  # 3) Enrich bằng "mini VRL" script
-  enrich:
+  # Giữ bản gốc vào raw_log, đồng thời đặt message để parse
+  linux_syslog_capture_raw:
     type: script
     inputs:
-      - normalize
+      - linux_syslog_http
     script: |
-      .soc_tenant = "tenant01"
-      .severity = upcase(.severity)
+      if exists(.log) {
+        .raw_log = .log
+        .message = .log
+      } else {
+        if exists(.message) {
+          .raw_log = .message
+        }
+      }
+
+  # Parse syslog text để lấy timestamp/host/program/message
+  linux_syslog_parse_main:
+    type: regex_parse
+    inputs:
+      - linux_syslog_capture_raw
+    field: message
+    pattern: '^(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<program>[^\[\s:]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<message>.*)$'
+    drop_on_error: false
+    remove_source: false
+
+  linux_syslog_parse_level:
+    type: regex_parse
+    inputs:
+      - linux_syslog_parse_main
+    field: message
+    pattern: '^.*?(?:level=(?P<level>\w+))?.*?(?:\[\s*(?P<bracket_severity>info|warn|warning|error|fatal|debug|trace)\s*\])?.*$'
+    drop_on_error: false
+    remove_source: false
+
+  # Bảo đảm có @timestamp/host/... nếu thiếu
+  linux_syslog_normalize:
+    type: normalize_schema
+    inputs:
+      - linux_syslog_parse_level
+    default_log_type: linux_syslog
+
+  # Remap-style cleanup/enrich
+  linux_syslog_script:
+    type: script
+    inputs:
+      - linux_syslog_normalize
+    script: |
+      # Ưu tiên dùng date/timestamp từ Fluent Bit nếu có, và xóa trường gốc sau khi dùng
+      if exists(.date) {
+        .@timestamp = parse_timestamp(.date)
+        del(.date)
+      } else {
+        if exists(.timestamp) {
+          .@timestamp = parse_timestamp(.timestamp)
+          del(.timestamp)
+        }
+      }
+
+      # Map level/bracket_severity → severity
+      if exists(.level) {
+        .severity = upcase(.level)
+        del(.level)
+      } else {
+        if exists(.bracket_severity) {
+          .severity = upcase(.bracket_severity)
+        }
+      }
+
+      # Chỉ fallback từ .log sang .message nếu message chưa có
+      if !exists(.message) && exists(.log) {
+        .message = .log
+      }
+
+      # Đặt log_type nếu thiếu
+      if !exists(.log_type) {
+        .log_type = "linux_syslog"
+      }
+
+      # Xoá các trường tạm không cần thiết
+      del(.bracket_severity)
+      # KHÔNG xóa .@timestamp nữa
+      # del(.\"@timestamp\")  # bỏ dòng này đi
+
 
 sinks:
-  console:
+  linux_syslog_console:
     type: console
     inputs:
-      - enrich
+      - linux_syslog_script
 
-  # OpenSearch sink (bulk)
   linux_syslog_opensearch:
     type: opensearch
     inputs:
-      - enrich
+      - linux_syslog_script
     endpoints:
       - "https://10.15.7.52:9200"
     mode: bulk
     bulk:
       index: "logs-linux-syslog-%Y.%m.%d"
+    retry:
+      attempts: 3
+      backoff_secs: 1
+      max_backoff_secs: 3
     auth:
       strategy: basic
       user: "admin"

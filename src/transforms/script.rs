@@ -8,6 +8,8 @@ use crate::transforms::Transform;
 pub enum Condition {
     Equals { left_field: String, right_literal: Option<String>, right_field: Option<String> },
     NotEquals { left_field: String, right_literal: Option<String>, right_field: Option<String> },
+    Exists { field: String },
+    NotExists { field: String },
     // We can add more later
 }
 
@@ -17,7 +19,12 @@ pub enum ScriptOp {
     AssignField { field: String, src: String },
     UpcaseField { field: String, src: String },
     ToInt { field: String, src: String },
+    ToFloat { field: String, src: String },
+    ToString { field: String, src: String },
     Split { field: String, src: String, delim: String },
+    ParseTimestamp { field: String, src: String },
+    Now { field: String },
+    DelField { field: String },
     DropEvent,
     If {
         condition: Condition,
@@ -104,6 +111,11 @@ impl ScriptTransform {
                 *cursor += 1;
                 continue;
             }
+            if let Some(stmt) = Self::parse_statement(line)? {
+                ops.push(stmt);
+                *cursor += 1;
+                continue;
+            }
 
             // Assignments
             if let Some(op) = Self::parse_assignment(line)? {
@@ -122,6 +134,20 @@ impl ScriptTransform {
         // Simple parser: .field == "literal" or .field == .other
         // Note: Check != first because == is substring of != if we are not careful?
         // But we split by string.
+
+        // exists(.field)
+        if s.starts_with("exists(") && s.ends_with(')') {
+            let inner = s.trim_start_matches("exists(").trim_end_matches(')').trim();
+            if inner.starts_with('.') && inner.len() > 1 {
+                return Ok(Condition::Exists { field: inner[1..].to_string() });
+            }
+        }
+        if s.starts_with("!exists(") && s.ends_with(')') {
+            let inner = s.trim_start_matches("!exists(").trim_end_matches(')').trim();
+            if inner.starts_with('.') && inner.len() > 1 {
+                return Ok(Condition::NotExists { field: inner[1..].to_string() });
+            }
+        }
         
         if s.contains("!=") {
              let parts: Vec<&str> = s.split("!=").collect();
@@ -201,6 +227,11 @@ impl ScriptTransform {
             }));
         }
 
+        // .field = now()
+        if right == "now()" {
+            return Ok(Some(ScriptOp::Now { field: field_name }));
+        }
+
         // .field = upcase(.src)
         if right.starts_with("upcase(") && right.ends_with(')') {
             let inner = right["upcase(".len()..right.len()-1].trim();
@@ -217,6 +248,39 @@ impl ScriptTransform {
             let inner = right["to_int(".len()..right.len()-1].trim();
             if inner.starts_with('.') {
                 return Ok(Some(ScriptOp::ToInt {
+                    field: field_name,
+                    src: inner[1..].to_string(),
+                }));
+            }
+        }
+
+        // .field = to_float(.src)
+        if right.starts_with("to_float(") && right.ends_with(')') {
+            let inner = right["to_float(".len()..right.len()-1].trim();
+            if inner.starts_with('.') {
+                return Ok(Some(ScriptOp::ToFloat {
+                    field: field_name,
+                    src: inner[1..].to_string(),
+                }));
+            }
+        }
+
+        // .field = to_string(.src)
+        if right.starts_with("to_string(") && right.ends_with(')') {
+            let inner = right["to_string(".len()..right.len()-1].trim();
+            if inner.starts_with('.') {
+                return Ok(Some(ScriptOp::ToString {
+                    field: field_name,
+                    src: inner[1..].to_string(),
+                }));
+            }
+        }
+
+        // .field = parse_timestamp(.src)
+        if right.starts_with("parse_timestamp(") && right.ends_with(')') {
+            let inner = right["parse_timestamp(".len()..right.len()-1].trim();
+            if inner.starts_with('.') {
+                return Ok(Some(ScriptOp::ParseTimestamp {
                     field: field_name,
                     src: inner[1..].to_string(),
                 }));
@@ -252,6 +316,17 @@ impl ScriptTransform {
         }
 
         anyhow::bail!("Invalid assignment: {}", line);
+    }
+
+    fn parse_statement(line: &str) -> Result<Option<ScriptOp>> {
+        // del(.field)
+        if line.starts_with("del(") && line.ends_with(')') {
+            let inner = line.trim_start_matches("del(").trim_end_matches(')').trim();
+            if inner.starts_with('.') && inner.len() > 1 {
+                return Ok(Some(ScriptOp::DelField { field: inner[1..].to_string() }));
+            }
+        }
+        Ok(None)
     }
 
     fn check_condition(&self, cond: &Condition, log: &crate::event::LogEvent) -> bool {
@@ -290,6 +365,8 @@ impl ScriptTransform {
                     true
                 }
             }
+            Condition::Exists { field } => log.fields.contains_key(field),
+            Condition::NotExists { field } => !log.fields.contains_key(field),
         }
     }
 
@@ -298,6 +375,9 @@ impl ScriptTransform {
         if event.as_log().is_none() {
             return true;
         }
+
+        // Handle standalone statements like del(...)
+        // parse_statement was not used in compile loop; add here for safety if needed.
 
         for op in ops {
             match op {
@@ -350,6 +430,65 @@ impl ScriptTransform {
                         }
                     }
                 }
+                ScriptOp::ToFloat { field, src } => {
+                    if let Some(log) = event.as_log_mut() {
+                        if let Some(v) = log.fields.get(src).cloned() {
+                            match v {
+                                Value::String(s) => {
+                                    if let Ok(f) = s.parse::<f64>() {
+                                        log.fields.insert(field.clone(), Value::Float(f));
+                                    }
+                                }
+                                Value::Integer(i) => {
+                                    log.fields.insert(field.clone(), Value::Float(i as f64));
+                                }
+                                Value::Float(f) => {
+                                    log.fields.insert(field.clone(), Value::Float(f));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                ScriptOp::ToString { field, src } => {
+                    if let Some(log) = event.as_log_mut() {
+                        if let Some(v) = log.fields.get(src).cloned() {
+                            let s = match v {
+                                Value::String(s) => s,
+                                Value::Integer(i) => i.to_string(),
+                                Value::Float(f) => f.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                Value::Timestamp(ts) => ts.to_rfc3339(),
+                                Value::Null => "null".to_string(),
+                                Value::Array(_) | Value::Object(_) | Value::Bytes(_) => format!("{:?}", v),
+                            };
+                            log.fields.insert(field.clone(), Value::String(s));
+                        }
+                    }
+                }
+                ScriptOp::ParseTimestamp { field, src } => {
+                    if let Some(log) = event.as_log_mut() {
+                        if let Some(Value::String(s)) = log.fields.get(src).cloned() {
+                            if let Some(ts) = crate::event::parse_timestamp(&s) {
+                                log.fields.insert(field.clone(), Value::Timestamp(ts));
+                            } else {
+                                // fallback: keep original string
+                                log.fields.insert(field.clone(), Value::String(s));
+                            }
+                        }
+                    }
+                }
+                ScriptOp::Now { field } => {
+                    if let Some(log) = event.as_log_mut() {
+                        let ts = chrono::Utc::now();
+                        log.fields.insert(field.clone(), Value::Timestamp(ts));
+                    }
+                }
+                ScriptOp::DelField { field } => {
+                    if let Some(log) = event.as_log_mut() {
+                        log.fields.remove(field);
+                    }
+                }
                 ScriptOp::DropEvent => return false,
                 ScriptOp::If { condition, then_ops, else_ops } => {
                     let cond_true = {
@@ -392,6 +531,46 @@ impl Transform for ScriptTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+        #[test]
+        fn parse_assignment_extended_funcs() {
+            // now()
+            let op = ScriptTransform::parse_assignment(".ts = now()").unwrap().unwrap();
+            match op {
+                ScriptOp::Now { field } => assert_eq!(field, "ts"),
+                _ => panic!("expected Now"),
+            }
+
+            // to_float
+            let op = ScriptTransform::parse_assignment(".f = to_float(.x)").unwrap().unwrap();
+            match op {
+                ScriptOp::ToFloat { field, src } => {
+                    assert_eq!(field, "f");
+                    assert_eq!(src, "x");
+                }
+                _ => panic!("expected ToFloat"),
+            }
+
+            // to_string
+            let op = ScriptTransform::parse_assignment(".s = to_string(.x)").unwrap().unwrap();
+            match op {
+                ScriptOp::ToString { field, src } => {
+                    assert_eq!(field, "s");
+                    assert_eq!(src, "x");
+                }
+                _ => panic!("expected ToString"),
+            }
+
+            // parse_timestamp
+            let op = ScriptTransform::parse_assignment(".ts = parse_timestamp(.raw)").unwrap().unwrap();
+            match op {
+                ScriptOp::ParseTimestamp { field, src } => {
+                    assert_eq!(field, "ts");
+                    assert_eq!(src, "raw");
+                }
+                _ => panic!("expected ParseTimestamp"),
+            }
+        }
 
     #[tokio::test]
     async fn test_script_logic() {
