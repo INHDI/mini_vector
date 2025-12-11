@@ -1,0 +1,23 @@
+sources:
+  test_in:
+    type: http
+    address: "127.0.0.1:19001"
+    path: "/logs"
+
+sinks:
+  test_os:
+    type: opensearch
+    inputs:
+      - test_in
+    endpoints:
+      - "http://127.0.0.1:19999"
+    mode: bulk
+    bulk:
+      index: "logs-%Y.%m.%d"
+    tls:
+      verify_certificate: false
+      verify_hostname: false
+    batch:
+      max_events: 50
+      timeout_secs: 1
+

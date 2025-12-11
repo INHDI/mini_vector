@@ -1,3 +1,4 @@
+mod batcher;
 mod config;
 mod event;
 mod pipeline;
@@ -6,8 +7,10 @@ mod sources;
 mod transforms;
 
 use std::fs::File;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use axum::{routing::get, Router};
 use tracing::{info, warn};
 
 use crate::config::FullConfig;
@@ -19,15 +22,38 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("info")
         .init();
 
-    // Initialize Prometheus metrics (listen on port 9100 by default for scraping)
-    // We catch the error in case the port is busy, but we don't crash the app (maybe just log warning)
-    match metrics_exporter_prometheus::PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], 9100))
-        .install()
-    {
-        Ok(_) => info!("Prometheus metrics listening on 0.0.0.0:9100"),
-        Err(e) => warn!("Failed to install Prometheus recorder: {}", e),
-    }
+    // Initialize Prometheus metrics
+    // We install the recorder but manage the HTTP server ourselves to add /health
+    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let handle = builder
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+
+    let metrics_port = std::env::var("METRICS_PORT")
+        .unwrap_or_else(|_| "9100".to_string())
+        .parse::<u16>()
+        .unwrap_or(9100);
+
+    // Spawn Metrics & Health server
+    tokio::spawn(async move {
+        let app = Router::new()
+            .route("/metrics", get(move || std::future::ready(handle.render())))
+            .route("/health", get(|| async { "OK" }));
+
+        let addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
+        info!("Metrics and Health API listening on {}", addr);
+
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, app).await {
+                    warn!("Metrics server error: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to bind metrics port {}: {}", metrics_port, e);
+            }
+        }
+    });
 
     let config_path = std::env::args()
         .nth(1)

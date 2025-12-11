@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::{
     FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig, WhenFull,
@@ -13,7 +13,9 @@ use crate::event::{Event, Value};
 // use crate::router::{EventRouter, RouterConfig};
 use crate::sinks::console::ConsoleSink;
 use crate::sinks::http::HttpSink;
+use crate::sinks::opensearch::OpenSearchSink;
 use crate::sinks::Sink;
+use crate::sources::file::FileSource;
 use crate::sources::http::HttpSource;
 use crate::sources::stdin::StdinSource;
 use crate::sources::Source;
@@ -30,6 +32,7 @@ const DEFAULT_CHANNEL_SIZE: usize = 1024;
 fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source>> {
     match cfg.kind.as_str() {
         "stdin" => Ok(Box::new(StdinSource)),
+        "file" => Ok(Box::new(FileSource::new(cfg.include.clone()))),
         "http" => {
             let addr_str = cfg
                 .address
@@ -152,7 +155,26 @@ fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
             Ok(Box::new(HttpSink::new(
                 name.to_string(),
                 endpoint,
+                cfg.batch.clone(),
             )))
+        }
+        "opensearch" | "elasticsearch" => {
+            let endpoints = cfg.endpoints.clone();
+            let mode = cfg.mode.clone().unwrap_or_else(|| "bulk".to_string());
+            let bulk = cfg
+                .bulk
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("sink '{}' (opensearch) missing bulk config", name))?;
+            let sink = OpenSearchSink::new(
+                name.to_string(),
+                endpoints,
+                mode,
+                bulk,
+                cfg.auth.clone(),
+                cfg.tls.clone(),
+                cfg.batch.clone(),
+            )?;
+            Ok(Box::new(sink))
         }
         other => anyhow::bail!("Unknown sink type '{}' for '{}'", other, name),
     }
@@ -182,6 +204,18 @@ async fn fan_out(event: Event, downstreams: &[Downstream]) {
 }
 
 pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
+    // Shutdown signal
+    let (shutdown_tx, _) = broadcast::channel(1);
+
+    // Spawn signal handler
+    let shutdown_tx_clone = shutdown_tx.clone();
+    task::spawn(async move {
+        if let Ok(_) = tokio::signal::ctrl_c().await {
+            info!("Received Ctrl+C, shutting down...");
+            let _ = shutdown_tx_clone.send(());
+        }
+    });
+
     // If no inputs are defined, we technically have a disconnected graph,
     // but we proceed anyway (maybe only sources running).
     // The previous run_pipeline_linear is removed as it's incompatible with async Transform::run.
@@ -281,8 +315,10 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
         let src = build_source(name, scfg)?;
         let downs = downstreams.get(name).cloned().unwrap_or_default();
         let (tx, mut rx) = mpsc::channel::<Event>(DEFAULT_CHANNEL_SIZE);
+        
+        let shutdown_rx = shutdown_tx.subscribe();
         source_tasks.push(task::spawn(async move {
-            src.run(tx).await;
+            src.run(tx, shutdown_rx).await;
         }));
         source_tasks.push(task::spawn(async move {
             while let Some(event) = rx.recv().await {
@@ -290,6 +326,11 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
             }
         }));
     }
+
+    // Drop channels to ensure they are closed when all tasks finish
+    drop(transform_channels);
+    drop(sink_channels);
+    drop(downstreams);
 
     for t in source_tasks {
         let _ = t.await;

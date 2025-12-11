@@ -1,0 +1,15 @@
+sources:
+  test_in:
+    type: http
+    address: "127.0.0.1:19001"
+    path: "/logs"
+
+sinks:
+  test_out:
+    type: http
+    endpoint: "http://127.0.0.1:19002/recv"
+    inputs:
+      - test_in
+    batch:
+      max_events: 50
+      timeout_secs: 1

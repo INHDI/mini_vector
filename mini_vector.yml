@@ -1,11 +1,16 @@
 sources:
-  stdin:
-    type: stdin
+  http_in:
+    type: http
+    address: "0.0.0.0:8000"   # Lắng nghe mọi IP trên port 8000
+    path: "/"                 # Hỗ trợ JSON array, NDJSON, gzip
+    
 
 transforms:
   # 1) Parse syslog text trong field message
   parse_syslog:
     type: regex_parse
+    inputs:
+      - http_in
     field: message
     pattern: '^(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<program>[^\[:]+)(?:\[\d+\])?:\s+(?P<severity>\w+)?\s*(?P<message>.*)$'
     drop_on_error: false         # nếu không khớp regex thì vẫn giữ event
@@ -14,6 +19,8 @@ transforms:
   # 2) Chuẩn hóa về schema Mini SOC
   normalize:
     type: normalize_schema
+    inputs:
+      - parse_syslog
     timestamp_field: timestamp   # -> @timestamp
     host_field: host             # -> host
     severity_field: severity     # -> severity
@@ -24,16 +31,35 @@ transforms:
   # 3) Enrich bằng "mini VRL" script
   enrich:
     type: script
+    inputs:
+      - normalize
     script: |
       .soc_tenant = "tenant01"
       .severity = upcase(.severity)
 
-router:
-  field: log_type
-  routes:
-    - equals: linux_syslog
-      sink: console
-
 sinks:
   console:
     type: console
+    inputs:
+      - enrich
+
+  # OpenSearch sink (bulk)
+  linux_syslog_opensearch:
+    type: opensearch
+    inputs:
+      - enrich
+    endpoints:
+      - "https://10.15.7.52:9200"
+    mode: bulk
+    bulk:
+      index: "logs-linux-syslog-%Y.%m.%d"
+    auth:
+      strategy: basic
+      user: "admin"
+      password: "ZyxSzX^N^1RGft"
+    tls:
+      verify_certificate: false
+      verify_hostname: false
+    batch:
+      max_events: 200
+      timeout_secs: 1

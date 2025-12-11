@@ -102,6 +102,7 @@ impl Transform for RegexParseTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Value;
 
     #[tokio::test]
     async fn parses_named_groups_and_removes_source() {

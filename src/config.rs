@@ -13,6 +13,10 @@ pub struct SourceConfig {
     pub address: Option<String>, // "0.0.0.0:9000"
     #[serde(default)]
     pub path: Option<String>, // "/ingest"
+
+    // File source config:
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +77,63 @@ pub struct SinkConfig {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub buffer: Option<SinkBufferConfig>,
+    #[serde(default)]
+    pub batch: Option<BatchConfig>,
+
+    // OpenSearch/Elasticsearch sink config:
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    #[serde(default)]
+    pub mode: Option<String>, // "bulk" supported
+    #[serde(default)]
+    pub bulk: Option<OpenSearchBulkConfig>,
+    #[serde(default)]
+    pub auth: Option<OpenSearchAuthConfig>,
+    #[serde(default)]
+    pub tls: Option<OpenSearchTlsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchConfig {
+    #[serde(default = "default_batch_size")]
+    pub max_events: usize,
+    #[serde(default = "default_batch_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_batch_size() -> usize {
+    10
+}
+
+fn default_batch_timeout() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenSearchBulkConfig {
+    pub index: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenSearchAuthConfig {
+    #[serde(default)]
+    pub strategy: String, // "basic"
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenSearchTlsConfig {
+    #[serde(default = "default_verify_true")]
+    pub verify_certificate: bool,
+    #[serde(default = "default_verify_true")]
+    pub verify_hostname: bool,
+}
+
+fn default_verify_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -210,6 +271,31 @@ impl FullConfig {
             if let Some(buf) = &sink_cfg.buffer {
                 if buf.max_events == 0 {
                     anyhow::bail!("sink '{}' buffer.max_events must be > 0", sink_name);
+                }
+            }
+            if let Some(batch) = &sink_cfg.batch {
+                if batch.max_events == 0 {
+                    anyhow::bail!("sink '{}' batch.max_events must be > 0", sink_name);
+                }
+                if batch.timeout_secs == 0 {
+                    anyhow::bail!("sink '{}' batch.timeout_secs must be > 0", sink_name);
+                }
+            }
+
+            if sink_cfg.kind == "opensearch" || sink_cfg.kind == "elasticsearch" {
+                if sink_cfg.endpoints.is_empty() {
+                    anyhow::bail!("sink '{}' (opensearch) requires non-empty endpoints", sink_name);
+                }
+                let mode = sink_cfg.mode.clone().unwrap_or_else(|| "bulk".to_string());
+                if mode != "bulk" {
+                    anyhow::bail!("sink '{}' (opensearch) only supports mode='bulk' for now", sink_name);
+                }
+                let bulk = sink_cfg
+                    .bulk
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("sink '{}' (opensearch) missing bulk config", sink_name))?;
+                if bulk.index.trim().is_empty() {
+                    anyhow::bail!("sink '{}' (opensearch) bulk.index cannot be empty", sink_name);
                 }
             }
         }

@@ -1,9 +1,16 @@
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
-use axum::{extract::State, routing::post, Json, Router as HttpRouter};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Router as HttpRouter,
+};
+use bytes::Bytes;
 use serde_json::Value as JsonValue;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
+use tower_http::decompression::RequestDecompressionLayer;
 use tracing::{info, warn};
 
 use crate::event::{value_from_json, Event};
@@ -25,28 +32,108 @@ impl HttpSource {
     }
 }
 
-async fn http_source_handler(State(state): State<HttpSourceState>, Json(body): Json<JsonValue>) {
+async fn send_object(obj: serde_json::Map<String, JsonValue>, tx: &mpsc::Sender<Event>) {
     let mut event = Event::new();
+    for (k, v) in obj {
+        event.insert(k, value_from_json(&v));
+    }
+    if let Err(err) = tx.send(event).await {
+        warn!("HttpSource: failed to send event: {}", err);
+    }
+}
 
-    match body {
-        JsonValue::Object(map) => {
-            for (k, v) in map {
-                event.insert(k, value_from_json(&v));
+async fn send_message(msg: String, tx: &mpsc::Sender<Event>) {
+    let mut event = Event::new();
+    event.insert("message", msg);
+    if let Err(err) = tx.send(event).await {
+        warn!("HttpSource: failed to send message event: {}", err);
+    }
+}
+
+async fn handle_json_value(val: JsonValue, tx: &mpsc::Sender<Event>) {
+    match val {
+        JsonValue::Object(map) => send_object(map, tx).await,
+        JsonValue::Array(arr) => {
+            for item in arr {
+                if let JsonValue::Object(map) = item {
+                    send_object(map, tx).await;
+                } else {
+                    send_message(item.to_string(), tx).await;
+                }
             }
         }
-        other => {
-            event.insert("message", other.to_string());
+        other => send_message(other.to_string(), tx).await,
+    }
+}
+
+async fn parse_ndjson(body: &str, tx: &mpsc::Sender<Event>) {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<JsonValue>(trimmed) {
+            Ok(JsonValue::Object(map)) => send_object(map, tx).await,
+            Ok(other) => send_message(other.to_string(), tx).await,
+            Err(_) => send_message(trimmed.to_string(), tx).await,
+        }
+    }
+}
+
+async fn http_source_handler(
+    State(state): State<HttpSourceState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Try JSON first when content-type is application/json
+    if content_type.starts_with("application/json") {
+        match serde_json::from_slice::<JsonValue>(&body) {
+            Ok(val) => {
+                handle_json_value(val, &state.tx).await;
+                return StatusCode::OK;
+            }
+            Err(err) => {
+                warn!("HttpSource: failed to parse JSON body: {}", err);
+                // fall through to NDJSON/plain parsing
+            }
         }
     }
 
-    if let Err(err) = state.tx.send(event).await {
-        warn!("HttpSource: failed to send event to pipeline: {}", err);
+    // NDJSON or text/plain: treat as newline-delimited JSON/text
+    if content_type.contains("application/x-ndjson")
+        || content_type.contains("application/json")
+        || content_type.contains("text/plain")
+        || content_type.is_empty()
+    {
+        match String::from_utf8(body.to_vec()) {
+            Ok(s) => {
+                parse_ndjson(&s, &state.tx).await;
+                return StatusCode::OK;
+            }
+            Err(err) => {
+                warn!("HttpSource: body is not valid UTF-8: {}", err);
+                let msg = format!("{:?}", body);
+                send_message(msg, &state.tx).await;
+                return StatusCode::OK;
+            }
+        }
     }
+
+    // Fallback: raw bytes to string
+    let msg = String::from_utf8_lossy(&body).to_string();
+    send_message(msg, &state.tx).await;
+    StatusCode::OK
 }
 
 #[async_trait]
 impl Source for HttpSource {
-    async fn run(self: Box<Self>, tx: mpsc::Sender<Event>) {
+    async fn run(self: Box<Self>, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
         info!(
             "HttpSource listening on http://{}{}",
             self.addr, self.path
@@ -55,6 +142,7 @@ impl Source for HttpSource {
         let state = HttpSourceState { tx };
         let app = HttpRouter::new()
             .route(&self.path, post(http_source_handler))
+            .layer(RequestDecompressionLayer::new())
             .with_state(state);
 
         let listener = match tokio::net::TcpListener::bind(self.addr).await {
@@ -68,7 +156,13 @@ impl Source for HttpSource {
             }
         };
 
-        if let Err(err) = axum::serve(listener, app).await {
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.recv().await;
+                info!("HttpSource received shutdown signal");
+            });
+
+        if let Err(err) = server.await {
             warn!("HttpSource error: {}", err);
         }
 

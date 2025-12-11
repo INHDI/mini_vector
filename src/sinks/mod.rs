@@ -5,6 +5,7 @@ use crate::event::Event;
 
 pub mod console;
 pub mod http;
+pub mod opensearch;
 
 #[async_trait]
 pub trait Sink: Send + Sync {
