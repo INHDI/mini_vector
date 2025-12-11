@@ -60,6 +60,9 @@ pub struct TransformConfig {
     pub script: Option<String>,
 
     #[serde(default)]
+    pub source: Option<String>,
+
+    #[serde(default)]
     pub pattern: Option<String>,
 
     #[serde(default)]
@@ -243,6 +246,11 @@ impl FullConfig {
                         }
                     }
                     "normalize_schema" => { /* no required fields */ }
+                    "remap" => {
+                        if t.source.as_deref().unwrap_or("").is_empty() {
+                            anyhow::bail!("transform '{}' (remap) missing 'source'", name);
+                        }
+                    }
                     other => anyhow::bail!("unknown transform type '{}' for '{}'", other, name),
                 }
             }

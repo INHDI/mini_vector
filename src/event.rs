@@ -1,192 +1,110 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+use tracing::error;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum Value {
-    Null,
-    String(String),
-    Integer(i64),
-    Float(f64),
-    Bool(bool),
-    Timestamp(DateTime<Utc>),
-    Array(Vec<Value>),
-    Object(BTreeMap<String, Value>),
-    Bytes(Vec<u8>),
+use crate::event::{Event, Value};
+use crate::transforms::Transform;
+
+// VRL
+use vrl::value::{Bytes as VrlBytes, KeyString, Value as VrlValue};
+
+/// Tạm thời: struct remap chỉ là khung.
+/// Bước sau mới nối compile / runtime của VRL vào.
+pub struct RemapTransform {
+    /// Source VRL script (nội dung field `source` trong mini_vector.yml)
+    pub source: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct LogEvent {
-    pub fields: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum Event {
-    Log(LogEvent),
-    // Metric(MetricEvent),
-    // Trace(TraceEvent),
-}
-
-impl Event {
-    pub fn new_log() -> Self {
-        Event::Log(LogEvent {
-            fields: BTreeMap::new(),
-        })
+impl RemapTransform {
+    pub fn new(source: String) -> Self {
+        Self { source }
     }
 
-    /// Convenience for legacy code: creates a new Log event
-    pub fn new() -> Self {
-        Self::new_log()
-    }
-
-    pub fn insert<S: Into<String>, V: Into<Value>>(&mut self, key: S, value: V) {
-        let Event::Log(log) = self;
-        log.fields.insert(key.into(), value.into());
-    }
-
-    pub fn get_str(&self, key: &str) -> Option<&str> {
-        match self {
-            Event::Log(log) => match log.fields.get(key) {
-                Some(Value::String(s)) => Some(s.as_str()),
-                _ => None,
-            },
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn get_timestamp(&self, key: &str) -> Option<DateTime<Utc>> {
-        match self {
-            Event::Log(log) => match log.fields.get(key) {
-                Some(Value::Timestamp(ts)) => Some(*ts),
-                Some(Value::String(s)) => parse_timestamp(s),
-                _ => None,
-            },
-        }
-    }
-    
-    #[allow(dead_code)]
-    pub fn as_log(&self) -> Option<&LogEvent> {
-        match self {
-            Event::Log(l) => Some(l),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn as_log_mut(&mut self) -> Option<&mut LogEvent> {
-        match self {
-            Event::Log(l) => Some(l),
-        }
+    /// Xử lý 1 event – hiện tại chỉ là no-op để fix compile.
+    /// Sau này mình sẽ:
+    ///   1. Convert Event -> VrlValue (object)
+    ///   2. Chạy VRL program
+    ///   3. Convert VrlValue -> Event
+    fn process_one(&mut self, _event: &mut Event) -> anyhow::Result<()> {
+        // TODO: tích hợp VRL compiler + runtime ở đây
+        Ok(())
     }
 }
 
-// Convenience conversions
-impl From<&str> for Value {
-    fn from(v: &str) -> Self {
-        Value::String(v.to_string())
-    }
-}
-impl From<String> for Value {
-    fn from(v: String) -> Self {
-        Value::String(v)
-    }
-}
-impl From<i64> for Value {
-    fn from(v: i64) -> Self {
-        Value::Integer(v)
-    }
-}
-impl From<f64> for Value {
-    fn from(v: f64) -> Self {
-        Value::Float(v)
-    }
-}
-impl From<bool> for Value {
-    fn from(v: bool) -> Self {
-        Value::Bool(v)
-    }
-}
-impl From<DateTime<Utc>> for Value {
-    fn from(v: DateTime<Utc>) -> Self {
-        Value::Timestamp(v)
-    }
-}
+#[async_trait]
+impl Transform for RemapTransform {
+    async fn run(
+        mut self: Box<Self>,
+        mut input: mpsc::Receiver<Event>,
+        output: mpsc::Sender<Event>,
+    ) {
+        while let Some(mut event) = input.recv().await {
+            if let Err(err) = self.process_one(&mut event) {
+                error!(target: "remap", "remap error: {err}");
+                // giống Vector: log lỗi rồi bỏ event đó
+                continue;
+            }
 
-pub fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    // Try RFC3339 with offset then fallback to common layouts
-    if let Ok(ts) = DateTime::parse_from_rfc3339(value) {
-        return Some(ts.with_timezone(&Utc));
-    }
-    if let Ok(ts) = DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f %z") {
-        return Some(ts.with_timezone(&Utc));
-    }
-    if let Ok(ts) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ts, Utc));
-    }
-    None
-}
-
-pub fn value_from_json(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
-            } else {
-                Value::String(n.to_string())
+            if output.send(event).await.is_err() {
+                break;
             }
         }
-        serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            Value::Array(arr.iter().map(value_from_json).collect())
+    }
+}
+
+/// Convert mini_vector::Value -> vrl::value::Value
+fn to_vrl_value(value: &Value) -> VrlValue {
+    match value {
+        Value::Null => VrlValue::Null,
+        Value::String(s) => VrlValue::from(s.clone()),
+        Value::Integer(i) => VrlValue::from(*i),
+        Value::Float(f) => VrlValue::from_f64_or_zero(*f),
+        Value::Bool(b) => VrlValue::from(*b),
+        Value::Timestamp(ts) => VrlValue::from(ts.clone()),
+        Value::Array(arr) => {
+            let inner: Vec<VrlValue> = arr.iter().map(to_vrl_value).collect();
+            VrlValue::from(inner)
         }
-        serde_json::Value::Object(map) => {
-            let mut out = BTreeMap::new();
+        Value::Object(map) => {
+            let mut obj: BTreeMap<KeyString, VrlValue> = BTreeMap::new();
             for (k, v) in map {
-                out.insert(k.clone(), value_from_json(v));
+                obj.insert(KeyString::from(k.as_str()), to_vrl_value(v));
             }
-            Value::Object(out)
+            VrlValue::from(obj)
+        }
+        Value::Bytes(bytes) => {
+            let b = VrlBytes::copy_from_slice(bytes);
+            VrlValue::from(b)
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_rfc3339_timestamp() {
-        let s = "2024-01-02T03:04:05Z";
-        let ts = parse_timestamp(s).expect("should parse rfc3339");
-        assert_eq!(ts, DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
-    }
-
-    #[test]
-    fn json_value_to_enum_variants() {
-        let json = serde_json::json!({
-            "null": null,
-            "bool": true,
-            "int": 42,
-            "float": 1.5,
-            "str": "hi",
-            "arr": [1, 2, null],
-            "obj": { "k": "v" }
-        });
-
-        if let Value::Object(map) = value_from_json(&json) {
-            assert!(matches!(map["null"], Value::Null));
-            assert!(matches!(map["bool"], Value::Bool(true)));
-            assert!(matches!(map["int"], Value::Integer(42)));
-            assert!(matches!(map["float"], Value::Float(f) if (f - 1.5).abs() < 1e-6));
-            assert!(matches!(map["str"], Value::String(ref s) if s == "hi"));
-            assert!(matches!(map["arr"], Value::Array(ref arr) if arr.len() == 3));
-            assert!(matches!(map["obj"], Value::Object(ref o) if o["k"] == Value::String("v".to_string())));
-        } else {
-            panic!("expected object conversion");
+/// Convert vrl::value::Value -> mini_vector::Value
+fn from_vrl_value(v: &VrlValue) -> Value {
+    match v {
+        VrlValue::Null => Value::Null,
+        VrlValue::Bytes(b) => Value::Bytes(b.to_vec()),
+        VrlValue::Regex(_) => Value::String(v.to_string_lossy().into_owned()),
+        VrlValue::Integer(i) => Value::Integer(*i),
+        VrlValue::Float(f) => {
+            // ordered_float::NotNan<f64> -> f64
+            let f64_val: f64 = (*f).into();
+            Value::Float(f64_val)
+        }
+        VrlValue::Boolean(b) => Value::Bool(*b),
+        VrlValue::Timestamp(ts) => Value::Timestamp(*ts),
+        VrlValue::Array(arr) => {
+            let inner = arr.iter().map(from_vrl_value).collect();
+            Value::Array(inner)
+        }
+        VrlValue::Object(obj) => {
+            let mut map = BTreeMap::new();
+            for (k, v2) in obj {
+                map.insert(k.to_string(), from_vrl_value(v2));
+            }
+            Value::Object(map)
         }
     }
 }

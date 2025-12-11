@@ -26,6 +26,8 @@ use crate::transforms::normalize_schema::NormalizeSchemaTransform;
 use crate::transforms::regex_parse::RegexParseTransform;
 use crate::transforms::script::ScriptTransform;
 use crate::transforms::Transform;
+use crate::transforms::remap::RemapTransform;
+
 
 const DEFAULT_CHANNEL_SIZE: usize = 1024;
 
@@ -138,6 +140,14 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
             let target_prefix = cfg.target_prefix.clone();
 
             let t = RegexParseTransform::new(name_owned, field, pattern, drop_on_error, remove_source, target_prefix)?;
+            Ok(Box::new(t))
+        }
+        "remap" => {
+            let source = cfg
+                .source
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (remap) missing 'source'", name))?;
+            let t = RemapTransform::new(name_owned, source)?;
             Ok(Box::new(t))
         }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
