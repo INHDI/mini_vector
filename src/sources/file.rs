@@ -115,7 +115,7 @@ impl Source for FileSource {
                              match event.kind {
                                 EventKind::Modify(_) => {
                                     for path in event.paths {
-                                        if let Some(reader) = readers.get_mut(&path) {
+                                         if let Some(reader) = readers.get_mut(&path) {
                                              read_new_lines(&self.name, path.to_str().unwrap_or("unknown"), reader, &tx).await;
                                          }
                                     }
