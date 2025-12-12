@@ -1,11 +1,20 @@
 use async_trait::async_trait;
+use metrics;
 use tokio::sync::{broadcast, mpsc};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::event::Event;
 use crate::sources::Source;
 
-pub struct StdinSource;
+pub struct StdinSource {
+    pub name: String,
+}
+
+impl StdinSource {
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+}
 
 #[async_trait]
 impl Source for StdinSource {
@@ -15,7 +24,7 @@ impl Source for StdinSource {
         let stdin = io::stdin();
         let mut reader = io::BufReader::new(stdin).lines();
 
-        info!("StdinSource started");
+        info!("StdinSource[{}] started", self.name);
         loop {
             tokio::select! {
                 res = reader.next_line() => {
@@ -26,16 +35,22 @@ impl Source for StdinSource {
                             if tx.send(event).await.is_err() {
                                 break;
                             }
+                            metrics::increment_counter!("events_out", "component" => self.name.clone());
                         }
-                        _ => break, // EOF or error
+                        Ok(None) => break, // EOF
+                        Err(err) => {
+                            warn!("StdinSource[{}] read error: {}", self.name, err);
+                            metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "read_error");
+                            break;
+                        }
                     }
                 }
                 _ = shutdown.recv() => {
-                    info!("StdinSource received shutdown signal");
+                    info!("StdinSource[{}] received shutdown signal", self.name);
                     break;
                 }
             }
         }
-        info!("StdinSource exiting");
+        info!("StdinSource[{}] exiting", self.name);
     }
 }

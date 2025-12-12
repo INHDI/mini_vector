@@ -10,24 +10,26 @@ use glob::glob;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
+use metrics;
 
 use crate::event::{Event, Value};
 use crate::sources::Source;
 
 pub struct FileSource {
+    pub name: String,
     pub include: Vec<String>,
 }
 
 impl FileSource {
-    pub fn new(include: Vec<String>) -> Self {
-        Self { include }
+    pub fn new(name: String, include: Vec<String>) -> Self {
+        Self { name, include }
     }
 }
 
 #[async_trait]
 impl Source for FileSource {
     async fn run(self: Box<Self>, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
-        info!("FileSource starting with patterns: {:?}", self.include);
+        info!("FileSource[{}] starting with patterns: {:?}", self.name, self.include);
 
         // Map of path -> (File handle, current position)
         let mut readers: HashMap<PathBuf, BufReader<File>> = HashMap::new();
@@ -113,8 +115,8 @@ impl Source for FileSource {
                              match event.kind {
                                 EventKind::Modify(_) => {
                                     for path in event.paths {
-                                         if let Some(reader) = readers.get_mut(&path) {
-                                             read_new_lines(path.to_str().unwrap_or("unknown"), reader, &tx).await;
+                                        if let Some(reader) = readers.get_mut(&path) {
+                                             read_new_lines(&self.name, path.to_str().unwrap_or("unknown"), reader, &tx).await;
                                          }
                                     }
                                 }
@@ -125,7 +127,7 @@ impl Source for FileSource {
                     }
                 }
                 _ = shutdown.recv() => {
-                    info!("FileSource received shutdown signal");
+                    info!("FileSource[{}] received shutdown signal", self.name);
                     break;
                 }
             }
@@ -133,7 +135,7 @@ impl Source for FileSource {
     }
 }
 
-async fn read_new_lines(source_name: &str, reader: &mut BufReader<File>, tx: &mpsc::Sender<Event>) {
+async fn read_new_lines(component: &str, source_name: &str, reader: &mut BufReader<File>, tx: &mpsc::Sender<Event>) {
     let mut line = String::new();
     loop {
         match reader.read_line(&mut line) {
@@ -155,11 +157,13 @@ async fn read_new_lines(source_name: &str, reader: &mut BufReader<File>, tx: &mp
                     error!("Failed to send event from FileSource: {}", e);
                     return;
                 }
+                metrics::increment_counter!("events_out", "component" => component.to_string());
                 
                 line.clear();
             }
             Err(e) => {
                 warn!("Error reading line from {:?}: {}", source_name, e);
+                metrics::increment_counter!("events_dropped", "component" => component.to_string(), "reason" => "read_error");
                 break;
             }
         }

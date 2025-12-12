@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use metrics;
 
 use crate::batcher::Batcher;
 use crate::config::BatchConfig;
@@ -25,7 +26,8 @@ impl HttpSink {
     }
 
     async fn send_batch(&self, events: Vec<Event>) {
-        if events.is_empty() {
+        let batch_len = events.len();
+        if batch_len == 0 {
             return;
         }
 
@@ -35,12 +37,24 @@ impl HttpSink {
 
         match res {
             Ok(r) => {
-                if !r.status().is_success() {
+                if r.status().is_success() {
+                    metrics::counter!(
+                        "events_out",
+                        batch_len as u64,
+                        "component" => self.name.clone()
+                    );
+                } else {
                     warn!(
                         "HttpSink[{}] status={} for batch of {} events",
                         self.name,
                         r.status(),
-                        events.len()
+                        batch_len
+                    );
+                    metrics::counter!(
+                        "events_failed",
+                        batch_len as u64,
+                        "component" => self.name.clone(),
+                        "reason" => "http_status"
                     );
                 }
             }
@@ -48,8 +62,14 @@ impl HttpSink {
                 warn!(
                     "HttpSink[{}] error sending batch of {} events: {}",
                     self.name,
-                    events.len(),
+                    batch_len,
                     err
+                );
+                metrics::counter!(
+                    "events_failed",
+                    batch_len as u64,
+                    "component" => self.name.clone(),
+                    "reason" => "http_error"
                 );
             }
         }
@@ -70,6 +90,7 @@ impl Sink for HttpSink {
                 maybe_event = rx.recv() => {
                     match maybe_event {
                         Some(event) => {
+                            metrics::increment_counter!("events_in", "component" => self.name.clone());
                             batcher.add(event);
                             if batcher.should_flush() {
                                 self.send_batch(batcher.take()).await;

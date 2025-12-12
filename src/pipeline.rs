@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{info, warn};
+use metrics;
 
 use crate::config::{
     FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig, WhenFull,
@@ -33,8 +34,8 @@ const DEFAULT_CHANNEL_SIZE: usize = 1024;
 
 fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source>> {
     match cfg.kind.as_str() {
-        "stdin" => Ok(Box::new(StdinSource)),
-        "file" => Ok(Box::new(FileSource::new(cfg.include.clone()))),
+        "stdin" => Ok(Box::new(StdinSource::new(name.to_string()))),
+        "file" => Ok(Box::new(FileSource::new(name.to_string(), cfg.include.clone()))),
         "http" => {
             let addr_str = cfg
                 .address
@@ -55,7 +56,7 @@ fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source
                 )
             })?;
 
-            Ok(Box::new(HttpSource::new(addr, path)))
+            Ok(Box::new(HttpSource::new(name.to_string(), addr, path)))
         }
         other => anyhow::bail!("Unknown source type '{}' for '{}'", other, name),
     }
@@ -147,7 +148,12 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .source
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' (remap) missing 'source'", name))?;
-            let t = RemapTransform::new(name_owned, source)?;
+            let drop_on_error = cfg.drop_on_error.unwrap_or(true);
+            let error_field = cfg
+                .error_field
+                .clone()
+                .or_else(|| Some("remap_error".to_string()));
+            let t = RemapTransform::new(name_owned, source, drop_on_error, error_field)?;
             Ok(Box::new(t))
         }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
@@ -193,6 +199,7 @@ fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
 
 #[derive(Clone)]
 struct Downstream {
+    name: String,
     tx: mpsc::Sender<Event>,
     mode: WhenFull,
 }
@@ -208,6 +215,11 @@ async fn fan_out(event: Event, downstreams: &[Downstream]) {
             WhenFull::DropNew => {
                 if let Err(err) = ds.tx.try_send(event.clone()) {
                     warn!("downstream drop_new: {}", err);
+                    metrics::increment_counter!(
+                        "events_dropped",
+                        "component" => ds.name.clone(),
+                        "reason" => "buffer_full"
+                    );
                 }
             }
         }
@@ -265,6 +277,7 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
                 let entry = downstreams.entry(inp.clone()).or_default();
                 if let Some(tx) = transform_channels.get(name) {
                     entry.push(Downstream {
+                        name: name.clone(),
                         tx: tx.clone(),
                         mode: WhenFull::Block,
                     });
@@ -277,6 +290,7 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
             let entry = downstreams.entry(inp.clone()).or_default();
             if let Some((tx, mode)) = sink_channels.get(sink_name) {
                 entry.push(Downstream {
+                    name: sink_name.clone(),
                     tx: tx.clone(),
                     mode: *mode,
                 });

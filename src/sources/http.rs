@@ -12,6 +12,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::{broadcast, mpsc};
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::{info, warn};
+use metrics;
 
 use crate::event::{value_from_json, Event};
 use crate::sources::Source;
@@ -19,63 +20,73 @@ use crate::sources::Source;
 #[derive(Clone)]
 pub struct HttpSourceState {
     tx: mpsc::Sender<Event>,
+    name: String,
 }
 
 pub struct HttpSource {
+    name: String,
     addr: SocketAddr,
     path: String,
 }
 
 impl HttpSource {
-    pub fn new(addr: SocketAddr, path: String) -> Self {
-        Self { addr, path }
+    pub fn new(name: String, addr: SocketAddr, path: String) -> Self {
+        Self { name, addr, path }
     }
 }
 
-async fn send_object(obj: serde_json::Map<String, JsonValue>, tx: &mpsc::Sender<Event>) {
+async fn send_object(component: &str, obj: serde_json::Map<String, JsonValue>, tx: &mpsc::Sender<Event>) {
     let mut event = Event::new();
     for (k, v) in obj {
         event.insert(k, value_from_json(&v));
     }
     if let Err(err) = tx.send(event).await {
         warn!("HttpSource: failed to send event: {}", err);
+    } else {
+        metrics::increment_counter!("events_out", "component" => component.to_string());
     }
 }
 
-async fn send_message(msg: String, tx: &mpsc::Sender<Event>) {
+async fn send_message(component: &str, msg: String, tx: &mpsc::Sender<Event>) {
     let mut event = Event::new();
     event.insert("message", msg);
     if let Err(err) = tx.send(event).await {
         warn!("HttpSource: failed to send message event: {}", err);
+    } else {
+        metrics::increment_counter!("events_out", "component" => component.to_string());
     }
 }
 
-async fn handle_json_value(val: JsonValue, tx: &mpsc::Sender<Event>) {
+async fn handle_json_value(component: &str, val: JsonValue, tx: &mpsc::Sender<Event>) {
     match val {
-        JsonValue::Object(map) => send_object(map, tx).await,
+        JsonValue::Object(map) => send_object(component, map, tx).await,
         JsonValue::Array(arr) => {
             for item in arr {
                 if let JsonValue::Object(map) = item {
-                    send_object(map, tx).await;
+                    send_object(component, map, tx).await;
                 } else {
-                    send_message(item.to_string(), tx).await;
+                    send_message(component, item.to_string(), tx).await;
                 }
             }
         }
-        other => send_message(other.to_string(), tx).await,
+        other => send_message(component, other.to_string(), tx).await,
     }
 }
 
-async fn parse_ndjson(body: &str, tx: &mpsc::Sender<Event>) {
+async fn parse_ndjson(component: &str, body: &str, tx: &mpsc::Sender<Event>) {
     for line in body.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         match serde_json::from_str::<JsonValue>(trimmed) {
-            Ok(JsonValue::Object(map)) => send_object(map, tx).await,
-            Ok(other) => send_message(other.to_string(), tx).await,
-            Err(_) => send_message(trimmed.to_string(), tx).await,
+            Ok(JsonValue::Object(map)) => send_object(component, map, tx).await,
+            Ok(other) => send_message(component, other.to_string(), tx).await,
+            Err(err) => {
+                warn!("HttpSource: failed to parse NDJSON line: {}", err);
+                metrics::increment_counter!("events_dropped", "component" => component.to_string(), "reason" => "read_error");
+                send_message(component, trimmed.to_string(), tx).await;
+            }
         }
     }
 }
@@ -95,7 +106,7 @@ async fn http_source_handler(
     if content_type.starts_with("application/json") {
         match serde_json::from_slice::<JsonValue>(&body) {
             Ok(val) => {
-                handle_json_value(val, &state.tx).await;
+                handle_json_value(&state.name, val, &state.tx).await;
                 return StatusCode::OK;
             }
             Err(err) => {
@@ -113,13 +124,13 @@ async fn http_source_handler(
     {
         match String::from_utf8(body.to_vec()) {
             Ok(s) => {
-                parse_ndjson(&s, &state.tx).await;
+                parse_ndjson(&state.name, &s, &state.tx).await;
                 return StatusCode::OK;
             }
             Err(err) => {
                 warn!("HttpSource: body is not valid UTF-8: {}", err);
                 let msg = format!("{:?}", body);
-                send_message(msg, &state.tx).await;
+                send_message(&state.name, msg, &state.tx).await;
                 return StatusCode::OK;
             }
         }
@@ -127,7 +138,7 @@ async fn http_source_handler(
 
     // Fallback: raw bytes to string
     let msg = String::from_utf8_lossy(&body).to_string();
-    send_message(msg, &state.tx).await;
+    send_message(&state.name, msg, &state.tx).await;
     StatusCode::OK
 }
 
@@ -135,11 +146,11 @@ async fn http_source_handler(
 impl Source for HttpSource {
     async fn run(self: Box<Self>, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
         info!(
-            "HttpSource listening on http://{}{}",
-            self.addr, self.path
+            "HttpSource[{}] listening on http://{}{}",
+            self.name, self.addr, self.path
         );
 
-        let state = HttpSourceState { tx };
+        let state = HttpSourceState { tx, name: self.name.clone() };
         let app = HttpRouter::new()
             .route(&self.path, post(http_source_handler))
             .layer(RequestDecompressionLayer::new())

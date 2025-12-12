@@ -33,7 +33,11 @@ impl Transform for ContainsFilterTransform {
                 }
                 metrics::increment_counter!("events_out", "component" => self.name.clone());
             } else {
-                metrics::increment_counter!("events_dropped", "component" => self.name.clone());
+                metrics::increment_counter!(
+                    "events_dropped",
+                    "component" => self.name.clone(),
+                    "reason" => "filtered_out"
+                );
             }
         }
     }

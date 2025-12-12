@@ -4,6 +4,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
     pub kind: String,
@@ -20,6 +21,7 @@ pub struct SourceConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransformConfig {
     #[serde(rename = "type")]
     pub kind: String,
@@ -40,6 +42,9 @@ pub struct TransformConfig {
     pub drop_on_error: Option<bool>,
     #[serde(default)]
     pub remove_source: Option<bool>,
+
+    #[serde(default = "default_remap_error_field")]
+    pub error_field: Option<String>,
 
     // normalize_schema options
     #[serde(default)]
@@ -69,7 +74,12 @@ pub struct TransformConfig {
     pub target_prefix: Option<String>,
 }
 
+fn default_remap_error_field() -> Option<String> {
+    Some("remap_error".to_string())
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     #[serde(rename = "type")]
     pub kind: String,
@@ -99,6 +109,7 @@ pub struct SinkConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchConfig {
     #[serde(default = "default_batch_size")]
     pub max_events: usize,
@@ -115,11 +126,13 @@ fn default_batch_timeout() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenSearchBulkConfig {
     pub index: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenSearchAuthConfig {
     #[serde(default)]
     pub strategy: String, // "basic"
@@ -130,6 +143,7 @@ pub struct OpenSearchAuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenSearchTlsConfig {
     #[serde(default = "default_verify_true")]
     pub verify_certificate: bool,
@@ -142,6 +156,7 @@ fn default_verify_true() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenSearchRetryConfig {
     #[serde(default = "default_retry_attempts")]
     pub attempts: u32,
@@ -159,6 +174,7 @@ fn default_retry_backoff_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SinkBufferConfig {
     #[serde(default = "default_buffer_size")]
     pub max_events: usize,
@@ -184,6 +200,7 @@ impl Default for WhenFull {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FullConfig {
     pub sources: HashMap<String, SourceConfig>,
     pub transforms: Option<IndexMap<String, TransformConfig>>,
@@ -249,6 +266,14 @@ impl FullConfig {
                     "remap" => {
                         if t.source.as_deref().unwrap_or("").is_empty() {
                             anyhow::bail!("transform '{}' (remap) missing 'source'", name);
+                        }
+                        let drop_on_error = t.drop_on_error.unwrap_or(true);
+                        let error_field = t.error_field.clone().unwrap_or_else(|| "remap_error".to_string());
+                        if !drop_on_error && error_field.trim().is_empty() {
+                            anyhow::bail!(
+                                "transform '{}' (remap) requires non-empty 'error_field' when drop_on_error=false",
+                                name
+                            );
                         }
                     }
                     other => anyhow::bail!("unknown transform type '{}' for '{}'", other, name),

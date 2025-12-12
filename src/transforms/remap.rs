@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use metrics;
 use vrl::compiler::{self, runtime::Runtime, state::RuntimeState, TargetValueRef, TimeZone};
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
@@ -13,16 +14,25 @@ pub struct RemapTransform {
     name: String,
     program: vrl::compiler::Program,
     runtime: Runtime,
+    drop_on_error: bool,
+    error_field: Option<String>,
 }
 
 impl RemapTransform {
-    pub fn new(name: String, source: String) -> Result<Self> {
+    pub fn new(
+        name: String,
+        source: String,
+        drop_on_error: bool,
+        error_field: Option<String>,
+    ) -> Result<Self> {
         let compiled = compiler::compile(&source, &stdlib::all())
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         Ok(Self {
             name,
             program: compiled.program,
             runtime: Runtime::new(RuntimeState::default()),
+            drop_on_error,
+            error_field,
         })
     }
 
@@ -61,6 +71,32 @@ impl RemapTransform {
         }
 
         Ok(())
+    }
+
+    fn attach_error_field(&self, event: &mut Event, err: String) {
+        let field = match &self.error_field {
+            Some(f) if !f.is_empty() => f,
+            _ => return,
+        };
+
+        let Event::Log(LogEvent { fields }) = event;
+        if let Some(value) = fields.get_mut(field) {
+            match value {
+                Value::Array(arr) => {
+                    arr.push(Value::String(err));
+                }
+                Value::String(s) => {
+                    let existing = std::mem::take(s);
+                    *value = Value::Array(vec![Value::String(existing), Value::String(err)]);
+                }
+                _ => {
+                    let taken = std::mem::replace(value, Value::Null);
+                    *value = Value::Array(vec![taken, Value::String(err)]);
+                }
+            }
+        } else {
+            fields.insert(field.clone(), Value::String(err));
+        }
     }
 }
 
@@ -114,17 +150,106 @@ fn from_vrl_value(v: &VrlValue) -> Value {
 impl Transform for RemapTransform {
     async fn run(mut self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
         while let Some(mut event) = input.recv().await {
-            if let Err(err) = self.process_one(&mut event) {
-                // policy: log warning and continue (drop event? or pass through unmodified?)
-                // The user's code seemed to suggest dropping or warning. 
-                // "tuỳ policy: log warning và drop, hay giữ nguyên event" -> "depends on policy: log warning and drop, or keep event"
-                // The original code had `continue` which means drop.
-                tracing::warn!(target = "transform.remap", name = %self.name, %err, "VRL transform failed");
-                continue;
+            metrics::increment_counter!("events_in", "component" => self.name.clone());
+
+            match self.process_one(&mut event) {
+                Ok(()) => {
+                    metrics::increment_counter!("events_out", "component" => self.name.clone());
+                    if output.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    if self.drop_on_error {
+                        tracing::warn!(target = "transform.remap", name = %self.name, %err_msg, "VRL transform failed");
+                        metrics::increment_counter!(
+                            "events_dropped",
+                            "component" => self.name.clone(),
+                            "reason" => "vrl_error"
+                        );
+                        continue;
+                    } else {
+                        tracing::warn!(target = "transform.remap", name = %self.name, %err_msg, "VRL transform failed, attaching error_field");
+                        self.attach_error_field(&mut event, err_msg);
+                        metrics::increment_counter!("events_out", "component" => self.name.clone());
+                        if output.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    fn event_with_message(msg: &str) -> Event {
+        let mut ev = Event::new();
+        ev.insert("message", msg.to_string());
+        ev
+    }
+
+    #[tokio::test]
+    async fn remap_drops_on_error_when_configured() {
+        let source = ". = parse_json!(.message)".to_string();
+        let t = RemapTransform::new("remap1".into(), source, true, Some("remap_error".into())).unwrap();
+
+        let (tx_in, rx_in) = mpsc::channel(4);
+        let (tx_out, mut rx_out) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            Box::new(t).run(rx_in, tx_out).await;
+        });
+
+        tx_in.send(event_with_message("hello")).await.unwrap();
+        drop(tx_in);
+
+        // Expect channel to close without yielding an event
+        let res = timeout(Duration::from_millis(200), rx_out.recv()).await;
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remap_attaches_error_field_when_not_dropping() {
+        let source = ". = parse_json!(.message)".to_string();
+        let t = RemapTransform::new(
+            "remap2".into(),
+            source,
+            false,
+            Some("remap_error".into()),
+        )
+        .unwrap();
+
+        let (tx_in, rx_in) = mpsc::channel(4);
+        let (tx_out, mut rx_out) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            Box::new(t).run(rx_in, tx_out).await;
+        });
+
+        tx_in.send(event_with_message("hello")).await.unwrap();
+        drop(tx_in);
+
+        let ev = timeout(Duration::from_millis(200), rx_out.recv())
+            .await
+            .expect("recv did not timeout")
+            .expect("event should exist");
+
+        let Event::Log(log) = ev;
+        let err_val = log.fields.get("remap_error").expect("error field missing");
+        match err_val {
+            Value::String(s) => assert!(!s.is_empty()),
+            Value::Array(arr) => {
+                assert!(arr.iter().any(|v| matches!(v, Value::String(s) if !s.is_empty())));
             }
-            if output.send(event).await.is_err() {
-                break;
-            }
+            _ => panic!("unexpected error field type"),
         }
     }
 }
