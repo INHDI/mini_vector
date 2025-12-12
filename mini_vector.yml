@@ -22,7 +22,13 @@ transforms:
       .message = .log.message
       .severity = upcase(to_string!(.log.severity))
       .timestamp = .log.timestamp
-      .@timestamp = parse_timestamp!(.log.timestamp)
+      if exists(.log.timestamp) && .log.timestamp != null {
+        .@timestamp = parse_timestamp!(.log.timestamp, format: "%+")
+      } else if exists(.timestamp) && .timestamp != null {
+        .@timestamp = parse_timestamp!(.timestamp, format: "%+")
+      } else {
+        .@timestamp = now()
+      }
       .log_type = "linux_syslog"
       .soc_tenant = "tenant01"
       del(.log)
@@ -33,12 +39,12 @@ sinks:
   linux_syslog_console:
     type: console
     inputs:
-      - linux_syslog_script
+      - linux_syslog_remap
 
   linux_syslog_opensearch:
     type: opensearch
     inputs:
-      - linux_syslog_script
+      - linux_syslog_remap
     endpoints:
       - "https://10.15.7.52:9200"
     mode: bulk
