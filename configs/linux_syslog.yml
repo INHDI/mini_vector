@@ -15,6 +15,10 @@ transforms:
     source: |
       . = parse_syslog!(.message)
       .raw_log = .message
+  detect:
+    type: detect
+    rules_path: configs/rules.yml
+    alert_outputs: ["alerts"]
   normalize:
     type: normalize_schema
     timestamp_field: timestamp
@@ -28,7 +32,13 @@ transforms:
 sinks:
   opensearch:
     type: opensearch
-    inputs: ["normalize"]
+    inputs: ["detect"]
     endpoints: ["https://opensearch:9200"]
     bulk:
       index: "logs-acme-linux_syslog-%Y.%m.%d"
+  alerts:
+    type: opensearch
+    inputs: ["detect"]
+    endpoints: ["https://opensearch:9200"]
+    bulk:
+      index: "alerts-acme-%Y.%m.%d"

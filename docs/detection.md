@@ -18,6 +18,7 @@ transforms:
   detect:
     type: detect
     rules_path: configs/rules.yml
+    alert_outputs: ["alerts"]   # gửi bản sao alert tới sink/transform tên "alerts"
     inputs: ["normalize"]
 ```
 

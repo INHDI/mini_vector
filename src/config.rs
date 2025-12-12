@@ -71,7 +71,6 @@ pub struct TransformConfig {
     pub default_tenant: Option<String>,
     #[serde(default)]
     pub rules_path: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub alert_outputs: Vec<String>,
 

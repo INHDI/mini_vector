@@ -210,7 +210,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .rules_path
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' (detect) missing 'rules_path'", name))?;
-            let t = DetectTransform::from_rules_file(name_owned, &path)?;
+            let t = DetectTransform::from_rules_file(name_owned, &path, cfg.alert_outputs.clone())?;
             Ok(Box::new(t))
         }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),

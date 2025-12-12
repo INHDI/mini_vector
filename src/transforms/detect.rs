@@ -37,10 +37,11 @@ pub struct CompiledRule {
 pub struct DetectTransform {
     pub name: String,
     pub rules: Vec<CompiledRule>,
+    pub alert_outputs: Vec<String>,
 }
 
 impl DetectTransform {
-    pub fn from_rules_file(name: String, path: &str) -> anyhow::Result<Self> {
+    pub fn from_rules_file(name: String, path: &str, alert_outputs: Vec<String>) -> anyhow::Result<Self> {
         let f = File::open(Path::new(path))?;
         let rules: Vec<DetectRule> = serde_yaml::from_reader(f)?;
         if rules.is_empty() {
@@ -58,7 +59,7 @@ impl DetectTransform {
                 runtime: Runtime::new(RuntimeState::default()),
             });
         }
-        Ok(Self { name, rules: compiled })
+        Ok(Self { name, rules: compiled, alert_outputs })
     }
 
     fn event_to_vrl(event: &Event) -> VrlValue {
@@ -114,6 +115,15 @@ impl Transform for DetectTransform {
                             "component" => self.name.clone(),
                             "rule_id" => rule.meta.id.clone()
                         );
+                        for target in &self.alert_outputs {
+                            let mut cloned = event.clone();
+                            let Event::Log(LogEvent { fields }) = &mut cloned;
+                            fields.insert("__route_target".to_string(), Value::String(target.clone()));
+                            if output.send(cloned).await.is_err() {
+                                break;
+                            }
+                            metrics::increment_counter!("events_out", "component" => self.name.clone());
+                        }
                         break;
                     }
                     Ok(false) => {}
@@ -178,7 +188,7 @@ mod tests {
   condition: '.foo == "bar"'
 "#,
         );
-        let t = DetectTransform::from_rules_file("detect".into(), file.path().to_str().unwrap()).unwrap();
+        let t = DetectTransform::from_rules_file("detect".into(), file.path().to_str().unwrap(), Vec::new()).unwrap();
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
@@ -209,7 +219,7 @@ mod tests {
   condition: '.foo == "bar"'
 "#,
         );
-        let t = DetectTransform::from_rules_file("detect".into(), file.path().to_str().unwrap()).unwrap();
+        let t = DetectTransform::from_rules_file("detect".into(), file.path().to_str().unwrap(), Vec::new()).unwrap();
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
