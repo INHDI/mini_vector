@@ -235,6 +235,98 @@ mod tests {
     use chrono::Duration;
 
     #[tokio::test]
+    async fn respects_timestamp_priority_and_is_deterministic() {
+        let mut event = Event::new();
+        event.insert("ts_preferred", "2024-01-02T03:04:05Z");
+        event.insert("@timestamp", "1999-01-01T00:00:00Z");
+
+        let t = NormalizeSchemaTransform::new(
+            "test".into(),
+            Some("ts_preferred".to_string()),
+            Some("host".to_string()),
+            None,
+            Some("program".to_string()),
+            Some("message".to_string()),
+            Some("linux_syslog".to_string()),
+            Some("acme".to_string()),
+        );
+
+        let (tx_in, rx_in) = mpsc::channel(2);
+        let (tx_out, mut rx_out) = mpsc::channel(2);
+        tx_in.send(event.clone()).await.unwrap();
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let first = rx_out.recv().await.unwrap().as_log().unwrap().fields.clone();
+        let second = rx_out.recv().await.unwrap().as_log().unwrap().fields.clone();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.get("@timestamp"),
+            Some(&Value::Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_on_invalid_timestamp_and_sets_defaults() {
+        let mut event = Event::new();
+        event.insert("timestamp", "not a ts");
+        let t = NormalizeSchemaTransform::new("test".into(), Some("timestamp".into()), None, None, None, None, Some("linux_syslog".into()), Some("acme".into()));
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        let before = Utc::now();
+        Box::new(t).run(rx_in, tx_out).await;
+        let after = Utc::now();
+
+        let event = rx_out.recv().await.unwrap();
+        let log = event.as_log().unwrap();
+        match log.fields.get("@timestamp") {
+            Some(Value::Timestamp(ts)) => {
+                assert!(*ts >= before && *ts <= after + Duration::seconds(1));
+            }
+            other => panic!("expected timestamp, got {:?}", other),
+        }
+        assert_eq!(log.fields.get("log_type"), Some(&Value::String("linux_syslog".into())));
+        assert_eq!(log.fields.get("host"), Some(&Value::String("unknown".into())));
+    }
+
+    #[tokio::test]
+    async fn normalizes_severity_and_raw_log_copy() {
+        let mut event = Event::new();
+        event.insert("level", "CRIT");
+        event.insert("message_raw", "raw-data");
+        let t = NormalizeSchemaTransform::new(
+            "test".into(),
+            None,
+            None,
+            Some("level".to_string()),
+            None,
+            Some("message".to_string()),
+            Some("linux_syslog".to_string()),
+            Some("acme".to_string()),
+        );
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+        Box::new(t).run(rx_in, tx_out).await;
+
+        let event = rx_out.recv().await.unwrap();
+        let log = event.as_log().unwrap();
+        assert_eq!(log.fields.get("severity"), Some(&Value::String("ERROR".into())));
+        assert_eq!(log.fields.get("raw_log"), Some(&Value::String("raw-data".into())));
+    }
+
+    #[tokio::test]
     async fn sets_defaults_when_missing() {
         let event = Event::new();
         let t0 = Utc::now();

@@ -12,6 +12,11 @@ Schema chuẩn cho mọi event trong mini_vector. Transform cần chuẩn hoá v
 - `message`: thông điệp chính.
 - `raw_log`: bản gốc (nếu có) để truy vết.
 
+## Parse → Rule contract (đóng băng)
+- Rule chỉ phụ thuộc bộ field chuẩn sau và giả định luôn hiện diện: `@timestamp`, `log_type`, `event.original/raw_log`, `host`, `program`, `severity`, `message`, `soc_tenant`, `process.pid` (nếu parser có).
+- Parser đảm bảo fallback: parse lỗi vẫn sinh event với các field trên (trừ pid nếu không có), kèm `raw_log` và thông điệp gốc.
+- Nếu parser thêm field phụ (vd. structured JSON), đặt dưới namespace riêng để không phá rule đã đóng băng.
+
 ## Trường bảo mật/chung
 - `src_ip`, `src_port`
 - `dest_ip`, `dest_port`

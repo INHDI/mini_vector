@@ -112,6 +112,86 @@ mod tests {
     use crate::event::Value;
 
     #[tokio::test]
+    async fn sets_error_when_missing_source_field_no_drop() {
+        let event = Event::new();
+        let t = JsonParseTransform::new("test".into(), "missing".into(), false, false, None);
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let event = rx_out.recv().await.expect("should output event");
+        let log = event.as_log().unwrap();
+        assert_eq!(
+            log.fields.get("json_parse_error"),
+            Some(&Value::String("missing_source_field".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn sets_error_on_invalid_json_when_not_dropping() {
+        let mut event = Event::new();
+        event.insert("message", "{invalid".to_string());
+        let t = JsonParseTransform::new("test".into(), "message".into(), false, false, None);
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let event = rx_out.recv().await.expect("should output event");
+        let log = event.as_log().unwrap();
+        assert!(log.fields.contains_key("json_parse_error"));
+        assert!(log.fields.get("message").is_some());
+    }
+
+    #[tokio::test]
+    async fn flags_non_object_json_when_not_dropping() {
+        let mut event = Event::new();
+        event.insert("message", "[1,2,3]".to_string());
+        let t = JsonParseTransform::new("test".into(), "message".into(), false, false, None);
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let event = rx_out.recv().await.expect("should output event");
+        let log = event.as_log().unwrap();
+        assert_eq!(
+            log.fields.get("json_parse_error"),
+            Some(&Value::String("not_a_json_object".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_merge_with_prefix() {
+        let mut event = Event::new();
+        event.insert("message", r#"{"sev":"WARN","pid":123}"#.to_string());
+        let t = JsonParseTransform::new("test".into(), "message".into(), false, true, Some("parsed".into()));
+
+        let (tx_in, rx_in) = mpsc::channel(2);
+        let (tx_out, mut rx_out) = mpsc::channel(2);
+        tx_in.send(event.clone()).await.unwrap();
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let first = rx_out.recv().await.unwrap().as_log().unwrap().fields.clone();
+        let second = rx_out.recv().await.unwrap().as_log().unwrap().fields.clone();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.get("parsed.sev"),
+            Some(&Value::String("WARN".into()))
+        );
+        assert_eq!(first.get("message"), None);
+    }
+
+    #[tokio::test]
     async fn parses_json_object_into_fields() {
         let mut event = Event::new();
         event.insert("message", r#"{"message":"hello","x":1}"#.to_string());

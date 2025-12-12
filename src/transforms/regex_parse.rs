@@ -105,6 +105,92 @@ mod tests {
     use crate::event::Value;
 
     #[tokio::test]
+    async fn passes_through_when_field_missing_and_no_drop() {
+        let event = Event::new();
+        let t = RegexParseTransform::new(
+            "test".into(),
+            "message".into(),
+            r"(?P<program>\w+): (?P<msg>.+)".into(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let event = rx_out.recv().await.expect("should output event");
+        let log = event.as_log().unwrap();
+
+        // No regex fields added, original untouched
+        assert!(log.fields.get("regex_parse_error").is_none());
+        assert!(log.fields.get("message").is_none());
+    }
+
+    #[tokio::test]
+    async fn preserves_event_on_empty_field_when_no_drop() {
+        let mut event = Event::new();
+        event.insert("message", "");
+
+        let t = RegexParseTransform::new(
+            "test".into(),
+            "message".into(),
+            r"(?P<program>\w+): (?P<msg>.+)".into(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let event = rx_out.recv().await.expect("should output event");
+        let log = event.as_log().unwrap();
+
+        // Empty input simply passes through without drop or additions
+        assert!(log.fields.get("message").is_some());
+        assert!(log.fields.get("regex_parse_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn deterministic_output_for_same_input() {
+        let mut event = Event::new();
+        event.insert("message", "auth[123]: started");
+
+        let t = RegexParseTransform::new(
+            "test".into(),
+            "message".into(),
+            r"(?P<program>\w+)(?:\[(?P<pid>\d+)\])?: (?P<body>.+)".into(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let (tx_in, rx_in) = mpsc::channel(2);
+        let (tx_out, mut rx_out) = mpsc::channel(2);
+        tx_in.send(event.clone()).await.unwrap();
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+
+        Box::new(t).run(rx_in, tx_out).await;
+        let first = rx_out.recv().await.unwrap().as_log().unwrap().fields.clone();
+        let second = rx_out.recv().await.unwrap().as_log().unwrap().fields.clone();
+        assert_eq!(first, second);
+        assert_eq!(first.get("program"), Some(&Value::String("auth".to_string())));
+        assert_eq!(first.get("pid"), Some(&Value::String("123".to_string())));
+        assert_eq!(first.get("body"), Some(&Value::String("started".to_string())));
+    }
+
+    #[tokio::test]
     async fn parses_named_groups_and_removes_source() {
         let mut event = Event::new();
         event.insert("message", "prog: hello");
