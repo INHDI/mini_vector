@@ -5,6 +5,8 @@ use crate::event::Event;
 
 pub mod file;
 pub mod http;
+pub mod syslog;
+pub mod tcp;
 pub mod stdin;
 
 #[async_trait]

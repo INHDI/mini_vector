@@ -1,0 +1,45 @@
+sources:
+  access_log:
+    type: file
+    include:
+      - "/var/log/nginx/access.log"
+
+transforms:
+  add_tenant:
+    type: add_field
+    field: soc_tenant
+    value: acme
+  parse_access:
+    type: regex_parse
+    field: message
+    pattern: '^(?P<src_ip>\\S+) \\S+ \\S+ \\[(?P<timestamp>[^\\]]+)\\] \"(?P<method>\\S+) (?P<path>[^ ]+) [^\"]+\" (?P<status>\\d{3}) (?P<bytes>\\d+) \"[^\"]*\" \"(?P<user_agent>[^\"]*)\"'
+    drop_on_error: false
+    remove_source: false
+    target_prefix: parsed
+  remap_access:
+    type: remap
+    source: |
+      .raw_log = .message
+      .src_ip = .parsed.src_ip
+      .action = .parsed.method
+      .result = .parsed.status
+      .path = .parsed.path
+      .bytes = to_int(.parsed.bytes)
+      .@timestamp = to_timestamp!(.parsed.timestamp, format: "%d/%b/%Y:%H:%M:%S %z")
+  normalize:
+    type: normalize_schema
+    timestamp_field: "@timestamp"
+    host_field: host
+    severity_field: severity
+    program_field: program
+    message_field: message
+    default_log_type: web_access
+    default_tenant: acme
+
+sinks:
+  opensearch:
+    type: opensearch
+    inputs: ["normalize"]
+    endpoints: ["https://opensearch:9200"]
+    bulk:
+      index: "logs-acme-web_access-%Y.%m.%d"

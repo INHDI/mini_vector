@@ -1,20 +1,22 @@
 mod batcher;
 mod config;
 mod event;
+mod health;
 mod pipeline;
+mod queue;
+mod reload;
 mod sinks;
 mod sources;
 mod transforms;
 
-use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use axum::{routing::get, Router};
 use tracing::{info, warn};
 
-use crate::config::FullConfig;
-use crate::pipeline::run_pipeline;
+use crate::reload::PipelineManager;
+use crate::health::HealthState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,10 +37,15 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(9100);
 
     // Spawn Metrics & Health server
+    let health = HealthState::new();
+    let health_clone = health.clone();
     tokio::spawn(async move {
         let app = Router::new()
             .route("/metrics", get(move || std::future::ready(handle.render())))
-            .route("/health", get(|| async { "OK" }));
+            .route("/health", get(move || {
+                let healthy = health_clone.is_healthy(60);
+                async move { if healthy { "UP" } else { "DOWN" } }
+            }));
 
         let addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
         info!("Metrics and Health API listening on {}", addr);
@@ -60,11 +67,6 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("mini_vector.yml"));
 
-    let file = File::open(&config_path)?;
-    let config: FullConfig = serde_yaml::from_reader(file)?;
-    config.validate()?;
-
-    info!("Loaded config from {:?}", config_path);
-
-    run_pipeline(config).await
+    let manager = PipelineManager::new(config_path, health);
+    manager.run().await
 }

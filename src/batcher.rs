@@ -2,12 +2,20 @@ use std::time::{Duration, Instant};
 
 use crate::config::BatchConfig;
 use crate::event::Event;
+use serde_json;
+
+pub struct Batch {
+    pub events: Vec<Event>,
+    pub bytes: usize,
+}
 
 pub struct Batcher {
     pub items: Vec<Event>,
-    pub max_size: usize,
+    pub max_events: usize,
+    pub max_bytes: usize,
     pub timeout: Duration,
     pub last_flush: Instant,
+    pub current_bytes: usize,
 }
 
 impl Batcher {
@@ -15,27 +23,39 @@ impl Batcher {
         if let Some(c) = config {
             Self {
                 items: Vec::with_capacity(c.max_events),
-                max_size: c.max_events,
+                max_events: c.max_events,
+                max_bytes: c.max_bytes,
                 timeout: Duration::from_secs(c.timeout_secs),
                 last_flush: Instant::now(),
+                current_bytes: 0,
             }
         } else {
             // No batch config provided -> batch size 1 (immediate)
             Self {
                 items: Vec::with_capacity(1),
-                max_size: 1,
+                max_events: 1,
+                max_bytes: 0,
                 timeout: Duration::ZERO,
                 last_flush: Instant::now(),
+                current_bytes: 0,
             }
         }
     }
 
     pub fn add(&mut self, event: Event) {
+        let bytes = estimate_event_size(&event);
+        self.current_bytes = self.current_bytes.saturating_add(bytes);
         self.items.push(event);
     }
 
     pub fn is_full(&self) -> bool {
-        self.items.len() >= self.max_size
+        if self.items.len() >= self.max_events {
+            return true;
+        }
+        if self.max_bytes > 0 && self.current_bytes >= self.max_bytes {
+            return true;
+        }
+        false
     }
 
     pub fn should_flush(&self) -> bool {
@@ -51,16 +71,16 @@ impl Batcher {
         self.last_flush.elapsed() >= self.timeout
     }
 
-    pub fn take(&mut self) -> Vec<Event> {
+    pub fn take(&mut self) -> Batch {
         self.last_flush = Instant::now();
-        // Replace current buffer with a new one
-        // If we expect consistent capacity, we might want to re-allocate with capacity.
+        let bytes = self.current_bytes;
+        self.current_bytes = 0;
         let items = std::mem::take(&mut self.items);
-        // optimization: if we know we want to reuse the buffer, we could swap. 
-        // But mem::take gives us the Vec, leaving an empty one.
-        // We probably want to reserve capacity for the new one if we are high throughput.
-        self.items.reserve(self.max_size);
-        items
+        self.items.reserve(self.max_events);
+        Batch {
+            events: items,
+            bytes,
+        }
     }
 
     pub fn remaining_time(&self) -> Duration {
@@ -74,6 +94,52 @@ impl Batcher {
         } else {
             self.timeout - elapsed
         }
+    }
+}
+
+fn estimate_event_size(event: &Event) -> usize {
+    serde_json::to_vec(event).map(|v| v.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Event;
+
+    fn simple_event() -> Event {
+        let mut ev = Event::new();
+        ev.insert("message", "hello");
+        ev
+    }
+
+    #[test]
+    fn flushes_by_event_count() {
+        let mut b = Batcher::new(Some(BatchConfig {
+            max_events: 2,
+            timeout_secs: 10,
+            max_bytes: 10_000,
+        }));
+        b.add(simple_event());
+        assert!(!b.should_flush());
+        b.add(simple_event());
+        assert!(b.should_flush());
+        let batch = b.take();
+        assert_eq!(batch.events.len(), 2);
+    }
+
+    #[test]
+    fn flushes_by_bytes() {
+        let mut b = Batcher::new(Some(BatchConfig {
+            max_events: 10,
+            timeout_secs: 10,
+            max_bytes: 20, // small
+        }));
+        b.add(simple_event());
+        b.add(simple_event());
+        assert!(b.should_flush());
+        let batch = b.take();
+        assert!(!batch.events.is_empty());
+        assert!(batch.bytes > 0);
     }
 }
 

@@ -21,6 +21,7 @@ async fn pipeline_like_flow_parses_and_normalizes() {
         Some("program".into()),
         Some("message".into()),
         None,
+        None,
     );
 
     let (tx_in, rx_in) = mpsc::channel(4);
@@ -67,6 +68,7 @@ async fn pipeline_defaults_when_fields_missing() {
         Some("severity".into()),
         Some("program".into()),
         Some("message".into()),
+        None,
         None,
     );
 

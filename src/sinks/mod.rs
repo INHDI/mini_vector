@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use crate::event::Event;
 
 pub mod console;
+pub mod file;
 pub mod http;
 pub mod opensearch;
 

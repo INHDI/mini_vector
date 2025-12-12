@@ -13,11 +13,14 @@ use crate::event::{Event, Value};
 // Router is deprecated in DAG mode, but we might keep it for legacy compat if we wanted to map it to a "RouterTransform"
 // use crate::router::{EventRouter, RouterConfig};
 use crate::sinks::console::ConsoleSink;
+use crate::sinks::file::FileSink;
 use crate::sinks::http::HttpSink;
 use crate::sinks::opensearch::OpenSearchSink;
 use crate::sinks::Sink;
 use crate::sources::file::FileSource;
 use crate::sources::http::HttpSource;
+use crate::sources::syslog::SyslogSource;
+use crate::sources::tcp::TcpSource;
 use crate::sources::stdin::StdinSource;
 use crate::sources::Source;
 use crate::transforms::add_field::AddFieldTransform;
@@ -28,6 +31,8 @@ use crate::transforms::regex_parse::RegexParseTransform;
 use crate::transforms::script::ScriptTransform;
 use crate::transforms::Transform;
 use crate::transforms::remap::RemapTransform;
+use crate::transforms::route::RouteTransform;
+use crate::transforms::detect::DetectTransform;
 
 
 const DEFAULT_CHANNEL_SIZE: usize = 1024;
@@ -57,6 +62,28 @@ fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source
             })?;
 
             Ok(Box::new(HttpSource::new(name.to_string(), addr, path)))
+        }
+        "syslog" => {
+            let addr = cfg
+                .address
+                .clone()
+                .unwrap_or_else(|| format!("0.0.0.0:{}", cfg.port.unwrap_or(514)));
+            let mode = cfg.mode.clone().unwrap_or_else(|| "udp".to_string());
+            let max_length = cfg.max_length.unwrap_or(65535);
+            Ok(Box::new(SyslogSource::new(
+                name.to_string(),
+                mode,
+                addr,
+                max_length,
+            )))
+        }
+        "tcp" => {
+            let addr = cfg
+                .address
+                .clone()
+                .unwrap_or_else(|| format!("0.0.0.0:{}", cfg.port.unwrap_or(9000)));
+            let max_length = cfg.max_length.unwrap_or(65535);
+            Ok(Box::new(TcpSource::new(name.to_string(), addr, max_length)))
         }
         other => anyhow::bail!("Unknown source type '{}' for '{}'", other, name),
     }
@@ -116,6 +143,7 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 cfg.program_field.clone(),
                 cfg.message_field.clone(),
                 cfg.default_log_type.clone(),
+                cfg.default_tenant.clone(),
             )))
         }
         "script" => {
@@ -156,11 +184,44 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
             let t = RemapTransform::new(name_owned, source, drop_on_error, error_field)?;
             Ok(Box::new(t))
         }
+        "route" => {
+            let routes_cfg = cfg
+                .routes
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (route) missing routes", name))?;
+            let mut compiled = Vec::new();
+            let mut default_outputs = Vec::new();
+            for (rname, rcfg) in routes_cfg {
+                if rname == "default" {
+                    default_outputs = rcfg.outputs.clone();
+                    continue;
+                }
+                let condition = rcfg
+                    .condition
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("transform '{}' route '{}' missing condition", name, rname))?;
+                compiled.push((rname, condition, rcfg.outputs.clone()));
+            }
+            let t = RouteTransform::new(name_owned, compiled, default_outputs)?;
+            Ok(Box::new(t))
+        }
+        "detect" => {
+            let path = cfg
+                .rules_path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("transform '{}' (detect) missing 'rules_path'", name))?;
+            let t = DetectTransform::from_rules_file(name_owned, &path)?;
+            Ok(Box::new(t))
+        }
         other => anyhow::bail!("Unknown transform type '{}' for '{}'", other, name),
     }
 }
 
-fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
+async fn build_sink(
+    name: &str,
+    cfg: &SinkConfig,
+    health: &crate::health::HealthState,
+) -> anyhow::Result<Box<dyn Sink>> {
     match cfg.kind.as_str() {
         "console" => Ok(Box::new(ConsoleSink::new(name.to_string()))),
         "http" => {
@@ -190,7 +251,17 @@ fn build_sink(name: &str, cfg: &SinkConfig) -> anyhow::Result<Box<dyn Sink>> {
                 cfg.tls.clone(),
                 cfg.batch.clone(),
                 cfg.retry.clone(),
+                Some(health.clone()),
             )?;
+            Ok(Box::new(sink))
+        }
+        "file" => {
+            let path = cfg
+                .path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("sink '{}' (file) missing 'path'", name))?;
+            let max_bytes = cfg.max_bytes.unwrap_or(10 * 1024 * 1024); // 10MB default
+            let sink = FileSink::new(name.to_string(), path, max_bytes).await?;
             Ok(Box::new(sink))
         }
         other => anyhow::bail!("Unknown sink type '{}' for '{}'", other, name),
@@ -205,7 +276,19 @@ struct Downstream {
 }
 
 async fn fan_out(event: Event, downstreams: &[Downstream]) {
+    let mut event = event;
+    let mut target: Option<String> = None;
+    let Event::Log(log) = &mut event;
+    if let Some(Value::String(route)) = log.fields.remove("__route_target") {
+        target = Some(route);
+    }
+
     for ds in downstreams {
+        if let Some(ref t) = target {
+            if ds.name != *t {
+                continue;
+            }
+        }
         match ds.mode {
             WhenFull::Block => {
                 if let Err(err) = ds.tx.send(event.clone()).await {
@@ -226,7 +309,11 @@ async fn fan_out(event: Event, downstreams: &[Downstream]) {
     }
 }
 
-pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
+pub async fn run_pipeline(
+    config: FullConfig,
+    external_shutdown: Option<broadcast::Receiver<()>>,
+    health: crate::health::HealthState,
+) -> anyhow::Result<()> {
     // Shutdown signal
     let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -238,6 +325,16 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
             let _ = shutdown_tx_clone.send(());
         }
     });
+
+    // External shutdown (reload/drain)
+    if let Some(mut rx) = external_shutdown {
+        let shutdown_tx_external = shutdown_tx.clone();
+        task::spawn(async move {
+            if rx.recv().await.is_ok() {
+                let _ = shutdown_tx_external.send(());
+            }
+        });
+    }
 
     // If no inputs are defined, we technically have a disconnected graph,
     // but we proceed anyway (maybe only sources running).
@@ -260,9 +357,9 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
         let buffer: SinkBufferConfig = scfg
             .buffer
             .clone()
-            .unwrap_or(SinkBufferConfig {
+            .unwrap_or_else(|| SinkBufferConfig {
                 max_events: DEFAULT_CHANNEL_SIZE,
-                when_full: WhenFull::Block,
+                ..SinkBufferConfig::default()
             });
         let (tx, rx) = mpsc::channel::<Event>(buffer.max_events);
         sink_channels.insert(name.clone(), (tx, buffer.when_full));
@@ -298,10 +395,40 @@ pub async fn run_pipeline(config: FullConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Route transform explicit outputs
+    if let Some(transforms) = &config.transforms {
+        for (name, cfg) in transforms {
+            if cfg.kind == "route" {
+                if let Some(routes) = &cfg.routes {
+                    for (_rname, rcfg) in routes {
+                        for out in &rcfg.outputs {
+                            let entry = downstreams.entry(name.clone()).or_default();
+                            if let Some(tx) = transform_channels.get(out) {
+                                entry.push(Downstream {
+                                    name: out.clone(),
+                                    tx: tx.clone(),
+                                    mode: WhenFull::Block,
+                                });
+                            } else if let Some((tx, mode)) = sink_channels.get(out) {
+                                entry.push(Downstream {
+                                    name: out.clone(),
+                                    tx: tx.clone(),
+                                    mode: *mode,
+                                });
+                            } else {
+                                warn!("route transform '{}' targets unknown output '{}'", name, out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Spawn sink tasks
     let mut sink_tasks = Vec::new();
     for (name, scfg) in &config.sinks {
-        let sink = build_sink(name, scfg)?;
+        let sink = build_sink(name, scfg, &health).await?;
         if let Some(rx) = sink_receivers.remove(name) {
             sink_tasks.push(task::spawn(async move {
                 sink.run(rx).await;

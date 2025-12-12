@@ -19,6 +19,7 @@ fn console_sink_with_inputs(inputs: Vec<String>, when_full: WhenFull) -> SinkCon
         buffer: Some(mini_vector::config::SinkBufferConfig {
             max_events: 1,
             when_full,
+            ..mini_vector::config::SinkBufferConfig::default()
         }),
         batch: None,
         endpoints: vec![],

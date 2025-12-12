@@ -1,0 +1,33 @@
+sources:
+  win_events:
+    type: http
+    address: "0.0.0.0:9201"
+    path: "/ingest"
+
+transforms:
+  add_tenant:
+    type: add_field
+    field: soc_tenant
+    value: acme
+  parse_json:
+    type: json_parse
+    field: message
+    drop_on_error: false
+    remove_source: false
+  normalize:
+    type: normalize_schema
+    timestamp_field: "@timestamp"
+    host_field: host
+    severity_field: level
+    program_field: channel
+    message_field: message
+    default_log_type: windows_event
+    default_tenant: acme
+
+sinks:
+  opensearch:
+    type: opensearch
+    inputs: ["normalize"]
+    endpoints: ["https://opensearch:9200"]
+    bulk:
+      index: "logs-acme-windows_event-%Y.%m.%d"

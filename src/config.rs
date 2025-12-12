@@ -18,6 +18,14 @@ pub struct SourceConfig {
     // File source config:
     #[serde(default)]
     pub include: Vec<String>,
+
+    // syslog / tcp sources
+    #[serde(default)]
+    pub mode: Option<String>, // udp/tcp
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub max_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +67,13 @@ pub struct TransformConfig {
     pub message_field: Option<String>,
     #[serde(default)]
     pub default_log_type: Option<String>,
+    #[serde(default)]
+    pub default_tenant: Option<String>,
+    #[serde(default)]
+    pub rules_path: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub alert_outputs: Vec<String>,
 
     // script transform
     #[serde(default)]
@@ -72,6 +87,18 @@ pub struct TransformConfig {
 
     #[serde(default)]
     pub target_prefix: Option<String>,
+
+    #[serde(default)]
+    pub routes: Option<IndexMap<String, RouteRouteConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRouteConfig {
+    #[serde(default)]
+    pub condition: Option<String>,
+    #[serde(default)]
+    pub outputs: Vec<String>,
 }
 
 fn default_remap_error_field() -> Option<String> {
@@ -106,6 +133,12 @@ pub struct SinkConfig {
     pub tls: Option<OpenSearchTlsConfig>,
     #[serde(default)]
     pub retry: Option<OpenSearchRetryConfig>,
+
+    // file sink config
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +148,8 @@ pub struct BatchConfig {
     pub max_events: usize,
     #[serde(default = "default_batch_timeout")]
     pub timeout_secs: u64,
+    #[serde(default = "default_batch_max_bytes")]
+    pub max_bytes: usize,
 }
 
 fn default_batch_size() -> usize {
@@ -123,6 +158,10 @@ fn default_batch_size() -> usize {
 
 fn default_batch_timeout() -> u64 {
     1
+}
+
+fn default_batch_max_bytes() -> usize {
+    1_048_576 // 1 MiB
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,10 +219,39 @@ pub struct SinkBufferConfig {
     pub max_events: usize,
     #[serde(default)]
     pub when_full: WhenFull,
+    #[allow(dead_code)]
+    #[serde(default = "default_buffer_max_bytes")]
+    pub max_bytes: usize,
+    #[allow(dead_code)]
+    #[serde(default = "default_buffer_timeout_secs")]
+    pub timeout_secs: u64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub queue: QueueType,
+}
+
+impl Default for SinkBufferConfig {
+    fn default() -> Self {
+        Self {
+            max_events: default_buffer_size(),
+            when_full: WhenFull::Block,
+            max_bytes: default_buffer_max_bytes(),
+            timeout_secs: default_buffer_timeout_secs(),
+            queue: QueueType::InMemory,
+        }
+    }
 }
 
 fn default_buffer_size() -> usize {
     1024
+}
+
+fn default_buffer_max_bytes() -> usize {
+    0 // unlimited
+}
+
+fn default_buffer_timeout_secs() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -191,6 +259,19 @@ fn default_buffer_size() -> usize {
 pub enum WhenFull {
     Block,
     DropNew,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueType {
+    InMemory,
+    Disk,
+}
+
+impl Default for QueueType {
+    fn default() -> Self {
+        QueueType::InMemory
+    }
 }
 
 impl Default for WhenFull {
@@ -214,6 +295,42 @@ impl FullConfig {
         }
         if self.sinks.is_empty() {
             anyhow::bail!("config must contain at least one sink");
+        }
+
+        for (name, s) in &self.sources {
+            match s.kind.as_str() {
+                "http" => {
+                    if s.address.is_none() {
+                        anyhow::bail!("source '{}' (http) missing 'address'", name);
+                    }
+                }
+                "file" => {
+                    if s.include.is_empty() {
+                        anyhow::bail!("source '{}' (file) missing 'include'", name);
+                    }
+                }
+                "syslog" => {
+                    let mode = s.mode.clone().unwrap_or_else(|| "udp".to_string());
+                    if mode != "udp" && mode != "tcp" {
+                        anyhow::bail!("source '{}' (syslog) invalid mode '{}'", name, mode);
+                    }
+                    if s.address.is_none() && s.port.is_none() {
+                        anyhow::bail!("source '{}' (syslog) requires 'address' or 'port'", name);
+                    }
+                    if s.max_length.unwrap_or(65535) == 0 {
+                        anyhow::bail!("source '{}' (syslog) max_length must be > 0", name);
+                    }
+                }
+                "tcp" => {
+                    if s.address.is_none() && s.port.is_none() {
+                        anyhow::bail!("source '{}' (tcp) requires 'address' or 'port'", name);
+                    }
+                    if s.max_length.unwrap_or(65535) == 0 {
+                        anyhow::bail!("source '{}' (tcp) max_length must be > 0", name);
+                    }
+                }
+                _ => {}
+            }
         }
 
         let mut node_names: HashSet<String> = self.sources.keys().cloned().collect();
@@ -276,6 +393,25 @@ impl FullConfig {
                             );
                         }
                     }
+                    "route" => {
+                        let routes = t.routes.as_ref().ok_or_else(|| anyhow::anyhow!("transform '{}' (route) missing 'routes'", name))?;
+                        if routes.is_empty() {
+                            anyhow::bail!("transform '{}' (route) requires at least one route", name);
+                        }
+                        for (rname, rcfg) in routes {
+                            if rcfg.outputs.is_empty() {
+                                anyhow::bail!("transform '{}' (route) route '{}' requires non-empty outputs", name, rname);
+                            }
+                            if rcfg.condition.as_deref().unwrap_or("").is_empty() && rname != "default" {
+                                anyhow::bail!("transform '{}' (route) route '{}' missing 'condition'", name, rname);
+                            }
+                        }
+                    }
+                    "detect" => {
+                        if t.rules_path.as_deref().unwrap_or("").is_empty() {
+                            anyhow::bail!("transform '{}' (detect) missing 'rules_path'", name);
+                        }
+                    }
                     other => anyhow::bail!("unknown transform type '{}' for '{}'", other, name),
                 }
             }
@@ -324,6 +460,9 @@ impl FullConfig {
                 if buf.max_events == 0 {
                     anyhow::bail!("sink '{}' buffer.max_events must be > 0", sink_name);
                 }
+                if buf.timeout_secs == 0 {
+                    anyhow::bail!("sink '{}' buffer.timeout_secs must be > 0", sink_name);
+                }
             }
             if let Some(batch) = &sink_cfg.batch {
                 if batch.max_events == 0 {
@@ -331,6 +470,9 @@ impl FullConfig {
                 }
                 if batch.timeout_secs == 0 {
                     anyhow::bail!("sink '{}' batch.timeout_secs must be > 0", sink_name);
+                }
+                if batch.max_bytes == 0 {
+                    anyhow::bail!("sink '{}' batch.max_bytes must be > 0", sink_name);
                 }
             }
 
@@ -360,6 +502,15 @@ impl FullConfig {
                     if retry.max_backoff_secs < retry.backoff_secs {
                         anyhow::bail!("sink '{}' (opensearch) retry.max_backoff_secs must be >= backoff_secs", sink_name);
                     }
+                }
+            }
+            if sink_cfg.kind == "file" {
+                let path = sink_cfg.path.as_ref().ok_or_else(|| anyhow::anyhow!("sink '{}' (file) missing path", sink_name))?;
+                if path.trim().is_empty() {
+                    anyhow::bail!("sink '{}' (file) path cannot be empty", sink_name);
+                }
+                if sink_cfg.max_bytes.unwrap_or(0) == 0 {
+                    anyhow::bail!("sink '{}' (file) max_bytes must be > 0", sink_name);
                 }
             }
         }

@@ -15,6 +15,7 @@ pub struct NormalizeSchemaTransform {
     pub program_field: Option<String>,
     pub message_field: Option<String>,
     pub default_log_type: Option<String>,
+    pub default_tenant: Option<String>,
 }
 
 impl NormalizeSchemaTransform {
@@ -26,6 +27,7 @@ impl NormalizeSchemaTransform {
         program_field: Option<String>,
         message_field: Option<String>,
         default_log_type: Option<String>,
+        default_tenant: Option<String>,
     ) -> Self {
         Self {
             name,
@@ -35,6 +37,7 @@ impl NormalizeSchemaTransform {
             program_field,
             message_field,
             default_log_type,
+            default_tenant,
         }
     }
 
@@ -139,7 +142,43 @@ impl NormalizeSchemaTransform {
         }
 
         if !log.fields.contains_key("soc_tenant") {
-            log.fields.insert("soc_tenant".to_string(), Value::String("unknown".to_string()));
+            let tenant = self
+                .default_tenant
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            log.fields.insert("soc_tenant".to_string(), Value::String(tenant));
+        }
+
+        // raw_log: prefer explicit raw_log/message_raw; otherwise leave absent
+        if !log.fields.contains_key("raw_log") {
+            if let Some(raw) = log
+                .fields
+                .get("raw_log")
+                .cloned()
+                .or_else(|| log.fields.get("message_raw").cloned())
+            {
+                log.fields.insert("raw_log".to_string(), raw);
+            }
+        }
+
+        // security/common mappings
+        copy_if_present(log, "src_ip", &["src_ip", "client_ip", "source_ip"]);
+        copy_if_present(log, "src_port", &["src_port", "source_port"]);
+        copy_if_present(log, "dest_ip", &["dest_ip", "destination_ip", "dst_ip", "server_ip"]);
+        copy_if_present(log, "dest_port", &["dest_port", "destination_port", "dst_port", "server_port"]);
+        copy_if_present(log, "user", &["user", "username", "account"]);
+        copy_if_present(log, "action", &["action", "verb", "method"]);
+        copy_if_present(log, "result", &["result", "status", "status_code", "outcome"]);
+        copy_if_present(log, "rule_id", &["rule_id", "signature_id", "sid"]);
+        copy_if_present(log, "rule_name", &["rule_name", "signature", "policy"]);
+    }
+}
+
+fn copy_if_present(log: &mut crate::event::LogEvent, target: &str, candidates: &[&str]) {
+    for src in candidates {
+        if let Some(v) = log.fields.get(*src).cloned() {
+            log.fields.insert(target.to_string(), v);
+            break;
         }
     }
 }
@@ -199,7 +238,7 @@ mod tests {
     async fn sets_defaults_when_missing() {
         let event = Event::new();
         let t0 = Utc::now();
-        let t = NormalizeSchemaTransform::new("test".into(), None, None, None, None, None, None);
+        let t = NormalizeSchemaTransform::new("test".into(), None, None, None, None, None, None, None);
         
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
@@ -243,6 +282,7 @@ mod tests {
             None,
             Some("message".to_string()),
             Some("custom".to_string()),
+            None,
         );
         
         let (tx_in, rx_in) = mpsc::channel(1);
@@ -273,7 +313,7 @@ mod tests {
         event.insert("sev", "warning");
         event.insert("sev_num", 2_i64);
         
-        let t = NormalizeSchemaTransform::new("test".into(), None, None, Some("sev".to_string()), None, None, None);
+        let t = NormalizeSchemaTransform::new("test".into(), None, None, Some("sev".to_string()), None, None, None, None);
         
         // Simulating run
         // To test multiple transforms in sequence we have to recreate channels or test logic directly.
@@ -301,6 +341,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
@@ -313,5 +354,45 @@ mod tests {
             event.as_log().unwrap().fields.get("severity"),
             Some(&Value::String("ERROR".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn maps_security_fields_and_tenant_default() {
+        let mut event = Event::new();
+        event.insert("client_ip", "1.1.1.1");
+        event.insert("destination_port", 443_i64);
+        event.insert("username", "alice");
+        event.insert("verb", "GET");
+        event.insert("status", "200");
+        event.insert("rule_id", "R1");
+        event.insert("signature", "TestRule");
+
+        let t = NormalizeSchemaTransform::new(
+            "test".into(),
+            None,
+            None,
+            None,
+            None,
+            Some("message".to_string()),
+            Some("web".to_string()),
+            Some("acme".to_string()),
+        );
+
+        let (tx_in, rx_in) = mpsc::channel(1);
+        let (tx_out, mut rx_out) = mpsc::channel(1);
+        tx_in.send(event).await.unwrap();
+        drop(tx_in);
+        Box::new(t).run(rx_in, tx_out).await;
+        let event = rx_out.recv().await.unwrap();
+        let log = event.as_log().unwrap();
+
+        assert_eq!(log.fields.get("src_ip"), Some(&Value::String("1.1.1.1".into())));
+        assert_eq!(log.fields.get("dest_port"), Some(&Value::Integer(443)));
+        assert_eq!(log.fields.get("user"), Some(&Value::String("alice".into())));
+        assert_eq!(log.fields.get("action"), Some(&Value::String("GET".into())));
+        assert_eq!(log.fields.get("result"), Some(&Value::String("200".into())));
+        assert_eq!(log.fields.get("rule_id"), Some(&Value::String("R1".into())));
+        assert_eq!(log.fields.get("rule_name"), Some(&Value::String("TestRule".into())));
+        assert_eq!(log.fields.get("soc_tenant"), Some(&Value::String("acme".into())));
     }
 }

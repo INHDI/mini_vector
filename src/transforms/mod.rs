@@ -10,6 +10,8 @@ pub mod normalize_schema;
 pub mod regex_parse;
 pub mod script;
 pub mod remap;
+pub mod route;
+pub mod detect;
 
 #[async_trait]
 pub trait Transform: Send + Sync {

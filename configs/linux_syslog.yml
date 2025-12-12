@@ -1,0 +1,34 @@
+sources:
+  syslog_in:
+    type: syslog
+    mode: udp
+    address: "0.0.0.0:5140"
+    max_length: 65535
+
+transforms:
+  add_tenant:
+    type: add_field
+    field: soc_tenant
+    value: acme
+  parse_syslog:
+    type: remap
+    source: |
+      . = parse_syslog!(.message)
+      .raw_log = .message
+  normalize:
+    type: normalize_schema
+    timestamp_field: timestamp
+    host_field: host
+    severity_field: severity
+    program_field: program
+    message_field: message
+    default_log_type: linux_syslog
+    default_tenant: acme
+
+sinks:
+  opensearch:
+    type: opensearch
+    inputs: ["normalize"]
+    endpoints: ["https://opensearch:9200"]
+    bulk:
+      index: "logs-acme-linux_syslog-%Y.%m.%d"

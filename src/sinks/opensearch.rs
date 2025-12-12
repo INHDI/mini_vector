@@ -6,12 +6,13 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 use metrics;
 
-use crate::batcher::Batcher;
+use crate::batcher::{Batch, Batcher};
 use crate::config::{
     BatchConfig, OpenSearchAuthConfig, OpenSearchBulkConfig, OpenSearchRetryConfig, OpenSearchTlsConfig,
 };
 use crate::event::{Event, Value};
 use crate::sinks::Sink;
+use crate::health::HealthState;
 
 #[derive(Clone)]
 pub struct OpenSearchSink {
@@ -24,6 +25,7 @@ pub struct OpenSearchSink {
     pub batch_config: Option<BatchConfig>,
     pub retry: OpenSearchRetryConfig,
     pub client: Client,
+    pub health: Option<HealthState>,
 }
 
 impl OpenSearchSink {
@@ -36,6 +38,7 @@ impl OpenSearchSink {
         tls: Option<OpenSearchTlsConfig>,
         batch_config: Option<BatchConfig>,
         retry: Option<OpenSearchRetryConfig>,
+        health: Option<HealthState>,
     ) -> anyhow::Result<Self> {
         let mut builder = reqwest::ClientBuilder::new();
 
@@ -64,6 +67,7 @@ impl OpenSearchSink {
                 max_backoff_secs: 3,
             }),
             client,
+            health,
         })
     }
 
@@ -114,14 +118,14 @@ impl OpenSearchSink {
         }
     }
 
-    async fn send_bulk(&self, events: Vec<Event>) {
-        let batch_len = events.len();
+    async fn send_bulk(&self, batch: Batch) {
+        let batch_len = batch.events.len();
         if batch_len == 0 {
             return;
         }
         let index = self.resolve_index();
         let mut body = String::new();
-        for ev in events {
+        for ev in batch.events {
             let header = serde_json::json!({ "index": { "_index": index } });
             let doc = Self::event_to_doc(ev);
             body.push_str(&serde_json::to_string(&header).unwrap_or_else(|_| "{}".into()));
@@ -164,6 +168,7 @@ impl OpenSearchSink {
                         "component" => self.name.clone(),
                         "reason" => "request_clone"
                     );
+                    metrics::increment_counter!("batches_failed", "component" => self.name.clone());
                     break;
                 }
             };
@@ -183,6 +188,20 @@ impl OpenSearchSink {
                             batch_len as u64,
                             "component" => self.name.clone()
                         );
+                        if let Some(h) = &self.health {
+                            h.mark_opensearch_ok();
+                        }
+                        metrics::increment_counter!("batches_sent", "component" => self.name.clone());
+                        metrics::counter!(
+                            "batch_size_event",
+                            batch_len as u64,
+                            "component" => self.name.clone()
+                        );
+                        metrics::counter!(
+                            "batch_size_bytes",
+                            batch.bytes as u64,
+                            "component" => self.name.clone()
+                        );
                         false
                     } else if has_errors || status.is_client_error() {
                         let reason = if has_errors { "mapping_error" } else { "client_error" };
@@ -200,6 +219,7 @@ impl OpenSearchSink {
                             "component" => self.name.clone(),
                             "reason" => reason
                         );
+                        metrics::increment_counter!("batches_failed", "component" => self.name.clone());
                         false
                     } else if status.is_server_error() && attempt < self.retry.attempts {
                         true
@@ -217,6 +237,7 @@ impl OpenSearchSink {
                             "component" => self.name.clone(),
                             "reason" => "server_error"
                         );
+                        metrics::increment_counter!("batches_failed", "component" => self.name.clone());
                         false
                     }
                 }
@@ -238,6 +259,7 @@ impl OpenSearchSink {
                             "component" => self.name.clone(),
                             "reason" => if err.is_timeout() { "timeout" } else { "http_error" }
                         );
+                        metrics::increment_counter!("batches_failed", "component" => self.name.clone());
                         false
                     }
                 }

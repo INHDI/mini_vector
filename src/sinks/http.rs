@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use metrics;
 
-use crate::batcher::Batcher;
+use crate::batcher::{Batch, Batcher};
 use crate::config::BatchConfig;
 use crate::event::Event;
 use crate::sinks::Sink;
@@ -25,13 +25,13 @@ impl HttpSink {
         }
     }
 
-    async fn send_batch(&self, events: Vec<Event>) {
-        let batch_len = events.len();
+    async fn send_batch(&self, batch: Batch) {
+        let batch_len = batch.events.len();
         if batch_len == 0 {
             return;
         }
 
-        let body = serde_json::to_value(&events).unwrap_or_else(|_| serde_json::json!([]));
+        let body = serde_json::to_value(&batch.events).unwrap_or_else(|_| serde_json::json!([]));
 
         let res = self.client.post(&self.endpoint).json(&body).send().await;
 
@@ -41,6 +41,17 @@ impl HttpSink {
                     metrics::counter!(
                         "events_out",
                         batch_len as u64,
+                        "component" => self.name.clone()
+                    );
+                    metrics::increment_counter!("batches_sent", "component" => self.name.clone());
+                    metrics::counter!(
+                        "batch_size_event",
+                        batch_len as u64,
+                        "component" => self.name.clone()
+                    );
+                    metrics::counter!(
+                        "batch_size_bytes",
+                        batch.bytes as u64,
                         "component" => self.name.clone()
                     );
                 } else {
@@ -56,6 +67,7 @@ impl HttpSink {
                         "component" => self.name.clone(),
                         "reason" => "http_status"
                     );
+                    metrics::increment_counter!("batches_failed", "component" => self.name.clone());
                 }
             }
             Err(err) => {
@@ -71,6 +83,7 @@ impl HttpSink {
                     "component" => self.name.clone(),
                     "reason" => "http_error"
                 );
+                metrics::increment_counter!("batches_failed", "component" => self.name.clone());
             }
         }
     }

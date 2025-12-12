@@ -1,0 +1,17 @@
+- id: R001
+  name: SSH brute force
+  description: High failed SSH attempts from same IP
+  severity: high
+  condition: '.log_type == "linux_syslog" && .program == "sshd" && contains(.message, "Failed password")'
+
+- id: R002
+  name: Web 5xx burst
+  description: Many 5xx responses
+  severity: medium
+  condition: '.log_type == "web_access" && to_int(.result) >= 500'
+
+- id: R003
+  name: Windows admin logon
+  description: Admin login detected
+  severity: medium
+  condition: '.log_type == "windows_event" && .user == "Administrator"'
