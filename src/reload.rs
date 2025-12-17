@@ -2,14 +2,14 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axum::{routing::post, Router};
+use axum::{Router, routing::post};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::config::FullConfig;
-use crate::pipeline::run_pipeline;
 use crate::health::HealthState;
+use crate::pipeline::run_pipeline;
 
 pub struct PipelineManager {
     config_path: PathBuf,
@@ -50,7 +50,10 @@ impl PipelineManager {
             health_clone.mark_config_ok();
             run_pipeline(cfg, Some(shutdown_rx), health_clone.clone()).await
         });
-        self.current = Some(RunningPipeline { shutdown: shutdown_tx, handle });
+        self.current = Some(RunningPipeline {
+            shutdown: shutdown_tx,
+            handle,
+        });
         Ok(())
     }
 
@@ -97,7 +100,7 @@ impl PipelineManager {
     async fn handle_sighup(reload_tx: mpsc::Sender<()>) {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             if let Ok(mut stream) = signal(SignalKind::hangup()) {
                 while stream.recv().await.is_some() {
                     let _ = reload_tx.send(()).await;
@@ -144,7 +147,7 @@ impl PipelineManager {
         let tx_for_http = self.reload_tx.clone();
         tokio::spawn(Self::spawn_http_reload(tx_for_http));
 
-        while let Some(_) = self.reload_rx.recv().await {
+        while self.reload_rx.recv().await.is_some() {
             self.reload().await;
         }
 

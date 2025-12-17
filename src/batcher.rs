@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use crate::config::BatchConfig;
 use crate::event::EventEnvelope;
-use serde_json;
 
 pub struct Batch {
     pub events: Vec<EventEnvelope>,
@@ -104,7 +103,7 @@ fn estimate_event_size(event: &EventEnvelope) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventEnvelope;
+    use crate::event::{Event, EventEnvelope};
 
     fn simple_event() -> EventEnvelope {
         let mut ev = Event::new();

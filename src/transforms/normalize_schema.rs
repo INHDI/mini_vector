@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use chrono::Utc;
+use tokio::sync::mpsc;
 
-use crate::event::{parse_timestamp, Event, EventEnvelope, Value};
+use crate::event::{Event, EventEnvelope, Value, parse_timestamp};
 use crate::transforms::Transform;
 
 /// NormalizeSchemaTransform: map field nguồn về schema Mini SOC
@@ -19,6 +19,7 @@ pub struct NormalizeSchemaTransform {
 }
 
 impl NormalizeSchemaTransform {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         timestamp_field: Option<String>,
@@ -42,9 +43,7 @@ impl NormalizeSchemaTransform {
     }
 
     fn apply_logic(&self, event: &mut Event) {
-        let log = match event {
-            Event::Log(l) => l,
-        };
+        let Event::Log(log) = event;
 
         // timestamp
         let ts_candidates = [
@@ -69,11 +68,7 @@ impl NormalizeSchemaTransform {
         log.fields.insert("@timestamp".to_string(), ts_value);
 
         // host/program/message passthrough with defaults
-        let host_candidates = [
-            self.host_field.as_deref(),
-            Some("hostname"),
-            Some("host"),
-        ];
+        let host_candidates = [self.host_field.as_deref(), Some("hostname"), Some("host")];
         for src in host_candidates.into_iter().flatten() {
             if let Some(v) = log.fields.get(src).cloned() {
                 log.fields.insert("host".to_string(), v);
@@ -81,7 +76,8 @@ impl NormalizeSchemaTransform {
             }
         }
         if !log.fields.contains_key("host") {
-            log.fields.insert("host".to_string(), Value::String("unknown".to_string()));
+            log.fields
+                .insert("host".to_string(), Value::String("unknown".to_string()));
         }
 
         let program_candidates = [
@@ -97,14 +93,11 @@ impl NormalizeSchemaTransform {
             }
         }
         if !log.fields.contains_key("program") {
-            log.fields.insert("program".to_string(), Value::String("unknown".to_string()));
+            log.fields
+                .insert("program".to_string(), Value::String("unknown".to_string()));
         }
 
-        let message_candidates = [
-            self.message_field.as_deref(),
-            Some("msg"),
-            Some("message"),
-        ];
+        let message_candidates = [self.message_field.as_deref(), Some("msg"), Some("message")];
         for src in message_candidates.into_iter().flatten() {
             if let Some(v) = log.fields.get(src).cloned() {
                 log.fields.insert("message".to_string(), v);
@@ -112,7 +105,8 @@ impl NormalizeSchemaTransform {
             }
         }
         if !log.fields.contains_key("message") {
-            log.fields.insert("message".to_string(), Value::String(String::new()));
+            log.fields
+                .insert("message".to_string(), Value::String(String::new()));
         }
 
         let severity_candidates = [
@@ -130,7 +124,8 @@ impl NormalizeSchemaTransform {
             }
         }
         if !severity_set {
-            log.fields.insert("severity".to_string(), Value::String("INFO".to_string()));
+            log.fields
+                .insert("severity".to_string(), Value::String("INFO".to_string()));
         }
 
         if !log.fields.contains_key("log_type") {
@@ -146,29 +141,41 @@ impl NormalizeSchemaTransform {
                 .default_tenant
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            log.fields.insert("soc_tenant".to_string(), Value::String(tenant));
+            log.fields
+                .insert("soc_tenant".to_string(), Value::String(tenant));
         }
 
         // raw_log: prefer explicit raw_log/message_raw; otherwise leave absent
-        if !log.fields.contains_key("raw_log") {
-            if let Some(raw) = log
+        if !log.fields.contains_key("raw_log")
+            && let Some(raw) = log
                 .fields
                 .get("raw_log")
                 .cloned()
                 .or_else(|| log.fields.get("message_raw").cloned())
-            {
-                log.fields.insert("raw_log".to_string(), raw);
-            }
+        {
+            log.fields.insert("raw_log".to_string(), raw);
         }
 
         // security/common mappings
         copy_if_present(log, "src_ip", &["src_ip", "client_ip", "source_ip"]);
         copy_if_present(log, "src_port", &["src_port", "source_port"]);
-        copy_if_present(log, "dest_ip", &["dest_ip", "destination_ip", "dst_ip", "server_ip"]);
-        copy_if_present(log, "dest_port", &["dest_port", "destination_port", "dst_port", "server_port"]);
+        copy_if_present(
+            log,
+            "dest_ip",
+            &["dest_ip", "destination_ip", "dst_ip", "server_ip"],
+        );
+        copy_if_present(
+            log,
+            "dest_port",
+            &["dest_port", "destination_port", "dst_port", "server_port"],
+        );
         copy_if_present(log, "user", &["user", "username", "account"]);
         copy_if_present(log, "action", &["action", "verb", "method"]);
-        copy_if_present(log, "result", &["result", "status", "status_code", "outcome"]);
+        copy_if_present(
+            log,
+            "result",
+            &["result", "status", "status_code", "outcome"],
+        );
         copy_if_present(log, "rule_id", &["rule_id", "signature_id", "sid"]);
         copy_if_present(log, "rule_name", &["rule_name", "signature", "policy"]);
     }
@@ -200,8 +207,10 @@ fn normalize_severity(value: Option<&Value>) -> Value {
                 5..=6 => "INFO",
                 _ => "DEBUG",
             }
-        } else if ["emerg", "fatal", "alert", "crit", "critical", "err", "error"]
-            .contains(&lower.as_str())
+        } else if [
+            "emerg", "fatal", "alert", "crit", "critical", "err", "error",
+        ]
+        .contains(&lower.as_str())
         {
             "ERROR"
         } else if ["warn", "warning", "notice"].contains(&lower.as_str()) {
@@ -228,7 +237,9 @@ impl Transform for NormalizeSchemaTransform {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
             self.apply_logic(&mut event.event);
             match output.send(event).await {
-                Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                Ok(_) => {
+                    metrics::increment_counter!("events_out", "component" => self.name.clone())
+                }
                 Err(err) => {
                     let ev = err.0;
                     ev.ack.ack();
@@ -248,8 +259,9 @@ mod tests {
     async fn sets_defaults_when_missing() {
         let event = EventEnvelope::new(Event::new());
         let t0 = Utc::now();
-        let t = NormalizeSchemaTransform::new("test".into(), None, None, None, None, None, None, None);
-        
+        let t =
+            NormalizeSchemaTransform::new("test".into(), None, None, None, None, None, None, None);
+
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(event).await.unwrap();
@@ -295,14 +307,14 @@ mod tests {
             Some("custom".to_string()),
             None,
         );
-        
+
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
 
         Box::new(t).run(rx_in, tx_out).await;
-        
+
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
 
@@ -324,13 +336,22 @@ mod tests {
         event.insert("sev", "warning");
         event.insert("sev_num", 2_i64);
         let envelope = EventEnvelope::new(event);
-        
-        let t = NormalizeSchemaTransform::new("test".into(), None, None, Some("sev".to_string()), None, None, None, None);
-        
+
+        let t = NormalizeSchemaTransform::new(
+            "test".into(),
+            None,
+            None,
+            Some("sev".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+
         // Simulating run
         // To test multiple transforms in sequence we have to recreate channels or test logic directly.
         // For simplicity, let's test `apply_logic` directly via run but one by one.
-        
+
         // Run 1
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
@@ -338,7 +359,7 @@ mod tests {
         drop(tx_in);
         Box::new(t).run(rx_in, tx_out).await;
         let event = rx_out.recv().await.unwrap();
-        
+
         assert_eq!(
             event.event.as_log().unwrap().fields.get("severity"),
             Some(&Value::String("WARN".to_string()))
@@ -361,7 +382,7 @@ mod tests {
         drop(tx_in);
         Box::new(t2).run(rx_in, tx_out).await;
         let event = rx_out.recv().await.unwrap();
-        
+
         assert_eq!(
             event.event.as_log().unwrap().fields.get("severity"),
             Some(&Value::String("ERROR".to_string()))
@@ -399,13 +420,22 @@ mod tests {
         let event = rx_out.recv().await.unwrap();
         let log = event.event.as_log().unwrap();
 
-        assert_eq!(log.fields.get("src_ip"), Some(&Value::String("1.1.1.1".into())));
+        assert_eq!(
+            log.fields.get("src_ip"),
+            Some(&Value::String("1.1.1.1".into()))
+        );
         assert_eq!(log.fields.get("dest_port"), Some(&Value::Integer(443)));
         assert_eq!(log.fields.get("user"), Some(&Value::String("alice".into())));
         assert_eq!(log.fields.get("action"), Some(&Value::String("GET".into())));
         assert_eq!(log.fields.get("result"), Some(&Value::String("200".into())));
         assert_eq!(log.fields.get("rule_id"), Some(&Value::String("R1".into())));
-        assert_eq!(log.fields.get("rule_name"), Some(&Value::String("TestRule".into())));
-        assert_eq!(log.fields.get("soc_tenant"), Some(&Value::String("acme".into())));
+        assert_eq!(
+            log.fields.get("rule_name"),
+            Some(&Value::String("TestRule".into()))
+        );
+        assert_eq!(
+            log.fields.get("soc_tenant"),
+            Some(&Value::String("acme".into()))
+        );
     }
 }

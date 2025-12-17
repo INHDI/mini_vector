@@ -4,37 +4,33 @@ use std::net::SocketAddr;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tracing::{info, warn};
-use metrics;
 
-use crate::config::{
-    FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig,
-};
+use crate::config::{FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig};
 use crate::event::{Event, EventEnvelope, Value};
 use crate::queue::{self, EnqueueStatus, SinkReceiver, SinkSender};
 // Router is deprecated in DAG mode, but we might keep it for legacy compat if we wanted to map it to a "RouterTransform"
 // use crate::router::{EventRouter, RouterConfig};
+use crate::sinks::Sink;
 use crate::sinks::console::ConsoleSink;
 use crate::sinks::file::FileSink;
 use crate::sinks::http::HttpSink;
 use crate::sinks::opensearch::OpenSearchSink;
-use crate::sinks::Sink;
+use crate::sources::Source;
 use crate::sources::file::FileSource;
 use crate::sources::http::HttpSource;
+use crate::sources::stdin::StdinSource;
 use crate::sources::syslog::SyslogSource;
 use crate::sources::tcp::TcpSource;
-use crate::sources::stdin::StdinSource;
-use crate::sources::Source;
+use crate::transforms::Transform;
 use crate::transforms::add_field::AddFieldTransform;
 use crate::transforms::contains_filter::ContainsFilterTransform;
+use crate::transforms::detect::DetectTransform;
 use crate::transforms::json_parse::JsonParseTransform;
 use crate::transforms::normalize_schema::NormalizeSchemaTransform;
 use crate::transforms::regex_parse::RegexParseTransform;
-use crate::transforms::script::ScriptTransform;
-use crate::transforms::Transform;
 use crate::transforms::remap::RemapTransform;
 use crate::transforms::route::RouteTransform;
-use crate::transforms::detect::DetectTransform;
-
+use crate::transforms::script::ScriptTransform;
 
 const DEFAULT_CHANNEL_SIZE: usize = 1024;
 
@@ -48,10 +44,7 @@ fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("source '{}' (http) missing 'address'", name))?;
 
-            let path = cfg
-                .path
-                .clone()
-                .unwrap_or_else(|| "/ingest".to_string());
+            let path = cfg.path.clone().unwrap_or_else(|| "/ingest".to_string());
 
             let addr: SocketAddr = addr_str.parse().map_err(|e| {
                 anyhow::anyhow!(
@@ -117,13 +110,14 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 .needle
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("transform '{}' missing 'needle'", name))?;
-            Ok(Box::new(ContainsFilterTransform::new(name_owned, field, needle)))
+            Ok(Box::new(ContainsFilterTransform::new(
+                name_owned, field, needle,
+            )))
         }
         "json_parse" => {
-            let field = cfg
-                .field
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("transform '{}' (json_parse) missing 'field'", name))?;
+            let field = cfg.field.clone().ok_or_else(|| {
+                anyhow::anyhow!("transform '{}' (json_parse) missing 'field'", name)
+            })?;
             let drop_on_error = cfg.drop_on_error.unwrap_or(false);
             let remove_source = cfg.remove_source.unwrap_or(false);
             let target_prefix = cfg.target_prefix.clone();
@@ -135,18 +129,16 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                 target_prefix,
             )))
         }
-        "normalize_schema" => {
-            Ok(Box::new(NormalizeSchemaTransform::new(
-                name_owned,
-                cfg.timestamp_field.clone(),
-                cfg.host_field.clone(),
-                cfg.severity_field.clone(),
-                cfg.program_field.clone(),
-                cfg.message_field.clone(),
-                cfg.default_log_type.clone(),
-                cfg.default_tenant.clone(),
-            )))
-        }
+        "normalize_schema" => Ok(Box::new(NormalizeSchemaTransform::new(
+            name_owned,
+            cfg.timestamp_field.clone(),
+            cfg.host_field.clone(),
+            cfg.severity_field.clone(),
+            cfg.program_field.clone(),
+            cfg.message_field.clone(),
+            cfg.default_log_type.clone(),
+            cfg.default_tenant.clone(),
+        ))),
         "script" => {
             let script = cfg
                 .script
@@ -156,20 +148,25 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
             Ok(Box::new(t))
         }
         "regex_parse" => {
-            let field = cfg
-                .field
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("transform '{}' (regex_parse) missing 'field'", name))?;
-            let pattern = cfg
-                .pattern
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("transform '{}' (regex_parse) missing 'pattern'", name))?;
+            let field = cfg.field.clone().ok_or_else(|| {
+                anyhow::anyhow!("transform '{}' (regex_parse) missing 'field'", name)
+            })?;
+            let pattern = cfg.pattern.clone().ok_or_else(|| {
+                anyhow::anyhow!("transform '{}' (regex_parse) missing 'pattern'", name)
+            })?;
 
             let drop_on_error = cfg.drop_on_error.unwrap_or(false);
             let remove_source = cfg.remove_source.unwrap_or(false);
             let target_prefix = cfg.target_prefix.clone();
 
-            let t = RegexParseTransform::new(name_owned, field, pattern, drop_on_error, remove_source, target_prefix)?;
+            let t = RegexParseTransform::new(
+                name_owned,
+                field,
+                pattern,
+                drop_on_error,
+                remove_source,
+                target_prefix,
+            )?;
             Ok(Box::new(t))
         }
         "remap" => {
@@ -197,20 +194,18 @@ fn build_transform(name: &str, cfg: &TransformConfig) -> anyhow::Result<Box<dyn 
                     default_outputs = rcfg.outputs.clone();
                     continue;
                 }
-                let condition = rcfg
-                    .condition
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("transform '{}' route '{}' missing condition", name, rname))?;
+                let condition = rcfg.condition.clone().ok_or_else(|| {
+                    anyhow::anyhow!("transform '{}' route '{}' missing condition", name, rname)
+                })?;
                 compiled.push((rname, condition, rcfg.outputs.clone()));
             }
             let t = RouteTransform::new(name_owned, compiled, default_outputs)?;
             Ok(Box::new(t))
         }
         "detect" => {
-            let path = cfg
-                .rules_path
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("transform '{}' (detect) missing 'rules_path'", name))?;
+            let path = cfg.rules_path.clone().ok_or_else(|| {
+                anyhow::anyhow!("transform '{}' (detect) missing 'rules_path'", name)
+            })?;
             let t = DetectTransform::from_rules_file(name_owned, &path, cfg.alert_outputs.clone())?;
             Ok(Box::new(t))
         }
@@ -239,10 +234,9 @@ async fn build_sink(
         "opensearch" | "elasticsearch" => {
             let endpoints = cfg.endpoints.clone();
             let mode = cfg.mode.clone().unwrap_or_else(|| "bulk".to_string());
-            let bulk = cfg
-                .bulk
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("sink '{}' (opensearch) missing bulk config", name))?;
+            let bulk = cfg.bulk.clone().ok_or_else(|| {
+                anyhow::anyhow!("sink '{}' (opensearch) missing bulk config", name)
+            })?;
             let sink = OpenSearchSink::new(
                 name.to_string(),
                 endpoints,
@@ -324,15 +318,15 @@ fn build_graph(config: &FullConfig) -> anyhow::Result<Graph> {
                 });
             }
             // route transform explicit outputs
-            if cfg.kind == "route" {
-                if let Some(routes) = &cfg.routes {
-                    for (_rname, rcfg) in routes {
-                        for out in &rcfg.outputs {
-                            edges.push(Edge {
-                                from: name.clone(),
-                                to: out.clone(),
-                            });
-                        }
+            if cfg.kind == "route"
+                && let Some(routes) = &cfg.routes
+            {
+                for (_rname, rcfg) in routes {
+                    for out in &rcfg.outputs {
+                        edges.push(Edge {
+                            from: name.clone(),
+                            to: out.clone(),
+                        });
                     }
                 }
             }
@@ -375,9 +369,7 @@ fn build_graph(config: &FullConfig) -> anyhow::Result<Graph> {
 
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for e in &edges {
-        adj.entry(e.from.clone())
-            .or_default()
-            .push(e.to.clone());
+        adj.entry(e.from.clone()).or_default().push(e.to.clone());
     }
 
     while let Some(n) = queue.pop_front() {
@@ -410,10 +402,10 @@ async fn fan_out(event: EventEnvelope, downstreams: &[Downstream]) {
     }
 
     for ds in downstreams {
-        if let Some(ref t) = target {
-            if ds.name != *t {
-                continue;
-            }
+        if let Some(ref t) = target
+            && ds.name != *t
+        {
+            continue;
         }
         match &ds.sender {
             EdgeSender::Channel(tx) => {
@@ -467,7 +459,7 @@ pub async fn run_pipeline(
     // Spawn signal handler
     let shutdown_tx_clone = shutdown_tx.clone();
     task::spawn(async move {
-        if let Ok(_) = tokio::signal::ctrl_c().await {
+        if tokio::signal::ctrl_c().await.is_ok() {
             info!("Received Ctrl+C, shutting down...");
             let _ = shutdown_tx_clone.send(());
         }
@@ -487,14 +479,11 @@ pub async fn run_pipeline(
     let mut sink_channels: HashMap<String, SinkSender> = HashMap::new();
     let mut sink_receivers: HashMap<String, SinkReceiver> = HashMap::new();
     for (name, scfg) in &config.sinks {
-        let buffer: SinkBufferConfig = scfg
-            .buffer
-            .clone()
-            .unwrap_or_else(|| SinkBufferConfig {
-                max_events: DEFAULT_CHANNEL_SIZE,
-                ..SinkBufferConfig::default()
-            });
-        let queue_path = buffer.queue_path.clone().map(|p| std::path::PathBuf::from(p));
+        let buffer: SinkBufferConfig = scfg.buffer.clone().unwrap_or_else(|| SinkBufferConfig {
+            max_events: DEFAULT_CHANNEL_SIZE,
+            ..SinkBufferConfig::default()
+        });
+        let queue_path = buffer.queue_path.clone().map(std::path::PathBuf::from);
         let max_segment_bytes = if buffer.max_bytes > 0 {
             buffer.max_bytes as u64
         } else {
@@ -604,7 +593,7 @@ pub async fn run_pipeline(
         let src = build_source(name, scfg)?;
         let downs = downstreams.get(name).cloned().unwrap_or_default();
         let (tx, mut rx) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
-        
+
         let shutdown_rx = shutdown_tx.subscribe();
         source_tasks.push(task::spawn(async move {
             src.run(tx, shutdown_rx).await;

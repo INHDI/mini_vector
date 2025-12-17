@@ -2,19 +2,19 @@ use std::net::SocketAddr;
 
 use async_trait::async_trait;
 use axum::{
+    Router as HttpRouter,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
-    Router as HttpRouter,
 };
 use bytes::Bytes;
+use metrics;
 use serde_json::Value as JsonValue;
 use tokio::sync::{broadcast, mpsc};
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::{info, warn};
-use metrics;
 
-use crate::event::{value_from_json, Event, EventEnvelope};
+use crate::event::{Event, EventEnvelope, value_from_json};
 use crate::sources::Source;
 
 #[derive(Clone)]
@@ -150,13 +150,20 @@ async fn http_source_handler(
 
 #[async_trait]
 impl Source for HttpSource {
-    async fn run(self: Box<Self>, tx: mpsc::Sender<EventEnvelope>, mut shutdown: broadcast::Receiver<()>) {
+    async fn run(
+        self: Box<Self>,
+        tx: mpsc::Sender<EventEnvelope>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
         info!(
             "HttpSource[{}] listening on http://{}{}",
             self.name, self.addr, self.path
         );
 
-        let state = HttpSourceState { tx, name: self.name.clone() };
+        let state = HttpSourceState {
+            tx,
+            name: self.name.clone(),
+        };
         let app = HttpRouter::new()
             .route(&self.path, post(http_source_handler))
             .layer(RequestDecompressionLayer::new())
@@ -165,19 +172,15 @@ impl Source for HttpSource {
         let listener = match tokio::net::TcpListener::bind(self.addr).await {
             Ok(l) => l,
             Err(err) => {
-                warn!(
-                    "HttpSource: failed to bind address {}: {}",
-                    self.addr, err
-                );
+                warn!("HttpSource: failed to bind address {}: {}", self.addr, err);
                 return;
             }
         };
 
-        let server = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown.recv().await;
-                info!("HttpSource received shutdown signal");
-            });
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown.recv().await;
+            info!("HttpSource received shutdown signal");
+        });
 
         if let Err(err) = server.await {
             warn!("HttpSource error: {}", err);

@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use tokio::sync::mpsc;
 use crate::event::EventEnvelope;
 use crate::transforms::Transform;
+use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 pub struct ContainsFilterTransform {
     pub name: String,
@@ -11,7 +11,11 @@ pub struct ContainsFilterTransform {
 
 impl ContainsFilterTransform {
     pub fn new(name: String, field: String, needle: String) -> Self {
-        Self { name, field, needle }
+        Self {
+            name,
+            field,
+            needle,
+        }
     }
 }
 
@@ -24,7 +28,7 @@ impl Transform for ContainsFilterTransform {
     ) {
         while let Some(event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
-            
+
             let keep = if let Some(v) = event.event.get_str(&self.field) {
                 v.contains(&self.needle)
             } else {

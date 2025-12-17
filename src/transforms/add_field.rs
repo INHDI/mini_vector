@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use tokio::sync::mpsc;
 use crate::event::{EventEnvelope, Value};
 use crate::transforms::Transform;
+use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 pub struct AddFieldTransform {
     pub name: String,
@@ -24,9 +24,9 @@ impl Transform for AddFieldTransform {
     ) {
         while let Some(mut event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
-            
+
             event.event.insert(self.field.clone(), self.value.clone());
-            
+
             match output.send(event).await {
                 Ok(_) => {
                     metrics::increment_counter!("events_out", "component" => self.name.clone());

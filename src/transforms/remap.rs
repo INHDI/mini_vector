@@ -1,15 +1,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use metrics;
-use vrl::compiler::{self, runtime::Runtime, state::RuntimeState, TargetValueRef, TimeZone};
+use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use vrl::compiler::{self, TargetValueRef, TimeZone, runtime::Runtime, state::RuntimeState};
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
-use std::collections::BTreeMap;
-use std::time::Duration;
-use std::panic::AssertUnwindSafe;
 
-use crate::event::{Event, EventEnvelope, Value, LogEvent};
+use crate::event::{Event, EventEnvelope, LogEvent, Value};
 use crate::transforms::Transform;
 
 const DEFAULT_REMAP_TIMEOUT_MS: u64 = 100;
@@ -30,8 +30,8 @@ impl RemapTransform {
         drop_on_error: bool,
         error_field: Option<String>,
     ) -> Result<Self> {
-        let compiled = compiler::compile(&source, &stdlib::all())
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let compiled =
+            compiler::compile(&source, &stdlib::all()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         Ok(Self {
             name,
             program: compiled.program,
@@ -155,7 +155,7 @@ fn from_vrl_value(v: &VrlValue) -> Value {
             } else {
                 Value::Bytes(b.to_vec())
             }
-        },
+        }
         VrlValue::Regex(r) => Value::String(r.as_str().to_string()), // fallback
         VrlValue::Array(arr) => Value::Array(arr.iter().map(from_vrl_value).collect()),
         VrlValue::Object(obj) => {
@@ -192,8 +192,14 @@ impl Transform for RemapTransform {
                 }
                 Err(err) => {
                     let err_msg = err.to_string();
-                    event.event.insert("transform_error".to_string(), Value::String(err_msg.clone()));
-                    event.event.insert("transform_error_stage".to_string(), Value::String("remap".to_string()));
+                    event.event.insert(
+                        "transform_error".to_string(),
+                        Value::String(err_msg.clone()),
+                    );
+                    event.event.insert(
+                        "transform_error_stage".to_string(),
+                        Value::String("remap".to_string()),
+                    );
                     if self.drop_on_error {
                         tracing::warn!(target = "transform.remap", name = %self.name, %err_msg, "VRL transform failed");
                         metrics::increment_counter!(
@@ -226,7 +232,7 @@ impl Transform for RemapTransform {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn event_with_message(msg: &str) -> EventEnvelope {
         let mut ev = Event::new();
@@ -237,7 +243,8 @@ mod tests {
     #[tokio::test]
     async fn remap_drops_on_error_when_configured() {
         let source = ". = parse_json!(.message)".to_string();
-        let t = RemapTransform::new("remap1".into(), source, true, Some("remap_error".into())).unwrap();
+        let t =
+            RemapTransform::new("remap1".into(), source, true, Some("remap_error".into())).unwrap();
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
@@ -258,13 +265,8 @@ mod tests {
     #[tokio::test]
     async fn remap_attaches_error_field_when_not_dropping() {
         let source = ". = parse_json!(.message)".to_string();
-        let t = RemapTransform::new(
-            "remap2".into(),
-            source,
-            false,
-            Some("remap_error".into()),
-        )
-        .unwrap();
+        let t = RemapTransform::new("remap2".into(), source, false, Some("remap_error".into()))
+            .unwrap();
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
@@ -286,7 +288,10 @@ mod tests {
         match err_val {
             Value::String(s) => assert!(!s.is_empty()),
             Value::Array(arr) => {
-                assert!(arr.iter().any(|v| matches!(v, Value::String(s) if !s.is_empty())));
+                assert!(
+                    arr.iter()
+                        .any(|v| matches!(v, Value::String(s) if !s.is_empty()))
+                );
             }
             _ => panic!("unexpected error field type"),
         }

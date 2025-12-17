@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::fmt;
 
 use tokio::sync::Notify;
 
@@ -258,9 +258,7 @@ pub fn value_from_json(v: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            Value::Array(arr.iter().map(value_from_json).collect())
-        }
+        serde_json::Value::Array(arr) => Value::Array(arr.iter().map(value_from_json).collect()),
         serde_json::Value::Object(map) => {
             let mut obj = BTreeMap::new();
             for (k, v2) in map {
@@ -286,10 +284,10 @@ pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     }
 
     // Epoch seconds
-    if let Ok(secs) = s.parse::<i64>() {
-        if let chrono::LocalResult::Single(dt) = Utc.timestamp_opt(secs, 0) {
-            return Some(dt);
-        }
+    if let Ok(secs) = s.parse::<i64>()
+        && let chrono::LocalResult::Single(dt) = Utc.timestamp_opt(secs, 0)
+    {
+        return Some(dt);
     }
 
     None

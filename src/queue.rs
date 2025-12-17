@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
@@ -67,8 +70,10 @@ impl MemoryQueue {
 
     fn push_drop_oldest(&self, event: EventEnvelope) -> EnqueueStatus {
         let mut guard = self.buf.lock().unwrap();
-        if guard.len() >= self.capacity {
-            guard.pop_front();
+        if guard.len() >= self.capacity
+            && let Some(ev) = guard.pop_front()
+        {
+            ev.ack.ack();
         }
         guard.push_back(event);
         self.available.notify_one();
@@ -155,6 +160,7 @@ impl DiskQueue {
             .create(true)
             .write(true)
             .read(true)
+            .truncate(false)
             .open(&write_path)?;
         let read_file = if state.read.segment <= state.write.segment {
             let rp = segment_path(&segments_dir, state.read.segment);
@@ -162,6 +168,7 @@ impl DiskQueue {
                 OpenOptions::new()
                     .create(true)
                     .read(true)
+                    .truncate(false)
                     .open(rp)?,
             )
         } else {
@@ -272,12 +279,18 @@ impl DiskQueue {
                 .map_err(anyhow::Error::from)?;
 
             let mut len_bytes = [0u8; 4];
-            reader.read_exact(&mut len_bytes).map_err(anyhow::Error::from)?;
+            reader
+                .read_exact(&mut len_bytes)
+                .map_err(anyhow::Error::from)?;
             let payload_len = u32::from_le_bytes(len_bytes) as usize;
             let mut payload = vec![0u8; payload_len];
-            reader.read_exact(&mut payload).map_err(anyhow::Error::from)?;
+            reader
+                .read_exact(&mut payload)
+                .map_err(anyhow::Error::from)?;
             let mut crc_bytes = [0u8; 4];
-            reader.read_exact(&mut crc_bytes).map_err(anyhow::Error::from)?;
+            reader
+                .read_exact(&mut crc_bytes)
+                .map_err(anyhow::Error::from)?;
             let crc_read = u32::from_le_bytes(crc_bytes);
             let mut hasher = Hasher::new();
             hasher.update(&payload);
@@ -366,11 +379,7 @@ impl DiskQueue {
     }
 }
 
-fn ensure_read_file(
-    inner: &mut DiskQueueInner,
-    segment: u64,
-    root: &Path,
-) -> anyhow::Result<()> {
+fn ensure_read_file(inner: &mut DiskQueueInner, segment: u64, root: &Path) -> anyhow::Result<()> {
     if inner.read_file.is_none() || inner.current_read_segment != segment {
         let seg_path = segment_path(&root.join("segments"), segment);
         inner.read_file = Some(OpenOptions::new().read(true).open(seg_path)?);
@@ -426,15 +435,27 @@ struct SinkQueueInner {
     policy: WhenFull,
     memory: Arc<MemoryQueue>,
     spill: Option<DiskQueue>,
+    closed: AtomicBool,
 }
 
 impl SinkQueueInner {
     async fn recv(&self) -> Option<EventEnvelope> {
         loop {
-            if let Some(spill) = &self.spill {
-                if let Ok(Some(ev)) = spill.try_pop().await {
+            if self.closed.load(Ordering::SeqCst) {
+                if let Some(ev) = self.memory.pop_nowait() {
                     return Some(ev);
                 }
+                if let Some(spill) = &self.spill
+                    && let Ok(Some(ev)) = spill.try_pop().await
+                {
+                    return Some(ev);
+                }
+                return None;
+            }
+            if let Some(spill) = &self.spill
+                && let Ok(Some(ev)) = spill.try_pop().await
+            {
+                return Some(ev);
             }
             if let Some(ev) = self.memory.pop_nowait() {
                 return Some(ev);
@@ -445,10 +466,14 @@ impl SinkQueueInner {
                     tokio::select! {
                         _ = self.memory.available_notifier().notified() => {},
                         _ = spill.notifier().notified() => {},
+                        _ = async { if self.closed.load(Ordering::SeqCst) {} } => {},
                     }
                 }
                 None => {
-                    self.memory.available_notifier().notified().await;
+                    tokio::select! {
+                        _ = self.memory.available_notifier().notified() => {},
+                        _ = async { if self.closed.load(Ordering::SeqCst) {} } => {},
+                    }
                 }
             }
         }
@@ -457,6 +482,10 @@ impl SinkQueueInner {
 
 impl SinkSender {
     pub async fn send(&self, event: EventEnvelope) -> EnqueueStatus {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            event.ack.ack();
+            return EnqueueStatus::Dropped;
+        }
         match self.inner.policy {
             WhenFull::Block => {
                 self.inner.memory.push_blocking(event).await;
@@ -470,28 +499,24 @@ impl SinkSender {
                 }
             },
             WhenFull::DropOldest => self.inner.memory.push_drop_oldest(event),
-            WhenFull::SpillToDisk => {
-                match self.inner.memory.try_push(event) {
-                    Ok(_) => EnqueueStatus::Enqueued,
-                    Err(ev) => {
-                        if let Some(spill) = &self.inner.spill {
-                            if let Err(err) = spill.push(ev).await {
-                                warn!(
-                                    "SinkQueue[{}] spill push failed: {}",
-                                    self.inner.name,
-                                    err
-                                );
-                                EnqueueStatus::Dropped
-                            } else {
-                                EnqueueStatus::Enqueued
-                            }
-                        } else {
-                            ev.ack.ack();
+            WhenFull::SpillToDisk => match self.inner.memory.try_push(event) {
+                Ok(_) => EnqueueStatus::Enqueued,
+                Err(ev) => {
+                    if let Some(spill) = &self.inner.spill {
+                        let ev_clone = ev.clone();
+                        if let Err(err) = spill.push(ev).await {
+                            warn!("SinkQueue[{}] spill push failed: {}", self.inner.name, err);
+                            ev_clone.ack.ack();
                             EnqueueStatus::Dropped
+                        } else {
+                            EnqueueStatus::Enqueued
                         }
+                    } else {
+                        ev.ack.ack();
+                        EnqueueStatus::Dropped
                     }
                 }
-            }
+            },
         }
     }
 }
@@ -499,6 +524,15 @@ impl SinkSender {
 impl SinkReceiver {
     pub async fn recv(&self) -> Option<EventEnvelope> {
         self.inner.recv().await
+    }
+
+    #[allow(dead_code)]
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.memory.available_notifier().notify_waiters();
+        if let Some(spill) = &self.inner.spill {
+            spill.notifier().notify_waiters();
+        }
     }
 }
 
@@ -524,6 +558,7 @@ pub fn sink_queue(
         policy,
         memory,
         spill,
+        closed: AtomicBool::new(false),
     });
     Ok((
         SinkSender {

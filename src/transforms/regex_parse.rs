@@ -1,9 +1,9 @@
-use async_trait::async_trait;
-use tokio::sync::mpsc;
-use regex::Regex;
-use tracing::warn;
 use crate::event::{Event, EventEnvelope};
 use crate::transforms::Transform;
+use async_trait::async_trait;
+use regex::Regex;
+use tokio::sync::mpsc;
+use tracing::warn;
 
 pub struct RegexParseTransform {
     pub name: String,
@@ -56,7 +56,9 @@ impl Transform for RegexParseTransform {
                         continue;
                     }
                     match output.send(event).await {
-                        Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                        Ok(_) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone())
+                        }
                         Err(err) => {
                             let ev = err.0;
                             ev.ack.ack();
@@ -68,26 +70,28 @@ impl Transform for RegexParseTransform {
             };
 
             if raw.trim().is_empty() {
-                 if self.drop_on_error {
-                     metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "empty_field");
-                     event.ack.ack();
-                     continue;
-                 }
-                 match output.send(event).await {
-                    Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                if self.drop_on_error {
+                    metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "empty_field");
+                    event.ack.ack();
+                    continue;
+                }
+                match output.send(event).await {
+                    Ok(_) => {
+                        metrics::increment_counter!("events_out", "component" => self.name.clone())
+                    }
                     Err(err) => {
                         let ev = err.0;
                         ev.ack.ack();
                         break;
                     }
-                 }
-                 continue;
+                }
+                continue;
             }
 
             if let Some(caps) = self.regex.captures(&raw) {
                 for name in self.regex.capture_names().flatten().filter(|n| *n != "0") {
                     if let Some(m) = caps.name(name) {
-                         let key = if let Some(prefix) = &self.target_prefix {
+                        let key = if let Some(prefix) = &self.target_prefix {
                             format!("{}.{}", prefix, name)
                         } else {
                             name.to_string()
@@ -100,9 +104,11 @@ impl Transform for RegexParseTransform {
                     let Event::Log(log) = &mut event.event;
                     log.fields.remove(&self.field);
                 }
-                
+
                 match output.send(event).await {
-                    Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                    Ok(_) => {
+                        metrics::increment_counter!("events_out", "component" => self.name.clone())
+                    }
                     Err(err) => {
                         let ev = err.0;
                         ev.ack.ack();
@@ -110,14 +116,19 @@ impl Transform for RegexParseTransform {
                     }
                 }
             } else {
-                warn!("RegexParseTransform: regex did not match field '{}': {}", self.field, raw);
+                warn!(
+                    "RegexParseTransform: regex did not match field '{}': {}",
+                    self.field, raw
+                );
                 if self.drop_on_error {
                     metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "no_match");
                     event.ack.ack();
                 } else {
                     event.event.insert("regex_parse_error".to_string(), true);
                     match output.send(event).await {
-                        Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                        Ok(_) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone())
+                        }
                         Err(err) => {
                             let ev = err.0;
                             ev.ack.ack();
@@ -149,14 +160,14 @@ mod tests {
             None,
         )
         .unwrap();
-        
+
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
 
         Box::new(t).run(rx_in, tx_out).await;
-        
+
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
 
@@ -185,14 +196,14 @@ mod tests {
             Some("parsed".to_string()),
         )
         .unwrap();
-        
+
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
 
         Box::new(t).run(rx_in, tx_out).await;
-        
+
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
 
@@ -200,6 +211,6 @@ mod tests {
             log.fields.get("regex_parse_error"),
             Some(&Value::Bool(true))
         );
-        assert!(log.fields.get("parsed.program").is_none());
+        assert!(!log.fields.contains_key("parsed.program"));
     }
 }

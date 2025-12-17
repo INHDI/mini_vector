@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use tracing::{info, error};
 use metrics;
+use tracing::{error, info};
 
 use crate::queue::SinkReceiver;
 use crate::sinks::Sink;
@@ -28,7 +28,10 @@ impl Sink for ConsoleSink {
                     metrics::increment_counter!("events_out", "component" => self.name.clone());
                 }
                 Err(err) => {
-                    error!("ConsoleSink[{}] failed to serialize event: {}", self.name, err);
+                    error!(
+                        "ConsoleSink[{}] failed to serialize event: {}",
+                        self.name, err
+                    );
                     metrics::increment_counter!(
                         "events_failed",
                         "component" => self.name.clone(),

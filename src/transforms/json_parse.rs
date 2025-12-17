@@ -1,8 +1,8 @@
+use crate::event::{Event, EventEnvelope, value_from_json};
+use crate::transforms::Transform;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::warn;
-use crate::event::{value_from_json, Event, EventEnvelope};
-use crate::transforms::Transform;
 
 pub struct JsonParseTransform {
     pub name: String,
@@ -43,13 +43,18 @@ impl Transform for JsonParseTransform {
             let raw = match event.event.get_str(&self.from_field) {
                 Some(s) => s.to_string(),
                 None => {
-                    warn!("JsonParseTransform: source field '{}' missing or not string", self.from_field);
+                    warn!(
+                        "JsonParseTransform: source field '{}' missing or not string",
+                        self.from_field
+                    );
                     if self.drop_on_error {
                         metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "missing_field");
                         event.ack.ack();
                         continue;
                     } else {
-                        event.event.insert("json_parse_error".to_string(), "missing_source_field");
+                        event
+                            .event
+                            .insert("json_parse_error".to_string(), "missing_source_field");
                         match output.send(event).await {
                             Ok(_) => {
                                 metrics::increment_counter!("events_out", "component" => self.name.clone());
@@ -66,21 +71,23 @@ impl Transform for JsonParseTransform {
             };
 
             if raw.trim().is_empty() {
-                 if self.drop_on_error {
-                     metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "empty_field");
-                     event.ack.ack();
-                     continue;
-                 }
-                 // pass through
-                 match output.send(event).await {
-                     Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
-                     Err(err) => {
+                if self.drop_on_error {
+                    metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "empty_field");
+                    event.ack.ack();
+                    continue;
+                }
+                // pass through
+                match output.send(event).await {
+                    Ok(_) => {
+                        metrics::increment_counter!("events_out", "component" => self.name.clone())
+                    }
+                    Err(err) => {
                         let ev = err.0;
                         ev.ack.ack();
                         break;
-                     }
-                 }
-                 continue;
+                    }
+                }
+                continue;
             }
 
             match serde_json::from_str::<serde_json::Value>(&raw) {
@@ -94,12 +101,14 @@ impl Transform for JsonParseTransform {
                         event.event.insert(key, value_from_json(&v));
                     }
                     if self.remove_source {
-                         let Event::Log(log) = &mut event.event;
-                         log.fields.remove(&self.from_field);
+                        let Event::Log(log) = &mut event.event;
+                        log.fields.remove(&self.from_field);
                     }
-                    
+
                     match output.send(event).await {
-                        Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                        Ok(_) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone())
+                        }
                         Err(err) => {
                             let ev = err.0;
                             ev.ack.ack();
@@ -108,36 +117,47 @@ impl Transform for JsonParseTransform {
                     }
                 }
                 Err(e) => {
-                     warn!("JsonParseTransform: failed to parse '{}' as JSON: {}", self.from_field, e);
-                     if self.drop_on_error {
-                         metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "parse_error");
-                         event.ack.ack();
-                     } else {
-                         event.event.insert("json_parse_error".to_string(), e.to_string());
-                         match output.send(event).await {
-                             Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
-                             Err(err) => {
+                    warn!(
+                        "JsonParseTransform: failed to parse '{}' as JSON: {}",
+                        self.from_field, e
+                    );
+                    if self.drop_on_error {
+                        metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "parse_error");
+                        event.ack.ack();
+                    } else {
+                        event
+                            .event
+                            .insert("json_parse_error".to_string(), e.to_string());
+                        match output.send(event).await {
+                            Ok(_) => {
+                                metrics::increment_counter!("events_out", "component" => self.name.clone())
+                            }
+                            Err(err) => {
                                 let ev = err.0;
                                 ev.ack.ack();
                                 break;
-                             }
-                         }
-                     }
+                            }
+                        }
+                    }
                 }
                 _ => {
                     if self.drop_on_error {
-                         metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "not_object");
-                         event.ack.ack();
+                        metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "not_object");
+                        event.ack.ack();
                     } else {
-                         event.event.insert("json_parse_error".to_string(), "not_a_json_object");
-                         match output.send(event).await {
-                             Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
-                             Err(err) => {
+                        event
+                            .event
+                            .insert("json_parse_error".to_string(), "not_a_json_object");
+                        match output.send(event).await {
+                            Ok(_) => {
+                                metrics::increment_counter!("events_out", "component" => self.name.clone())
+                            }
+                            Err(err) => {
                                 let ev = err.0;
                                 ev.ack.ack();
                                 break;
-                             }
-                         }
+                            }
+                        }
                     }
                 }
             }
@@ -148,32 +168,29 @@ impl Transform for JsonParseTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::event::Value;
+    use serde_json::json;
 
     #[tokio::test]
     async fn parses_json_object_into_fields() {
         let mut event = Event::new();
         event.insert("message", r#"{"message":"hello","x":1}"#.to_string());
         let envelope = EventEnvelope::new(event);
-        
+
         let t = JsonParseTransform::new("test".into(), "message".into(), false, true, None);
-        
+
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
-        
+
         Box::new(t).run(rx_in, tx_out).await;
-        
+
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
-        
+
         assert!(!log.fields.contains_key("message"));
-        assert_eq!(
-            log.fields.get("x"),
-            Some(&Value::Integer(1))
-        );
+        assert_eq!(log.fields.get("x"), Some(&Value::Integer(1)));
     }
 
     #[tokio::test]
@@ -186,16 +203,22 @@ mod tests {
         .to_string();
         event.insert("message", payload);
         let envelope = EventEnvelope::new(event);
-        
-        let t = JsonParseTransform::new("test".into(), "message".into(), false, false, Some("parsed".to_string()));
-        
+
+        let t = JsonParseTransform::new(
+            "test".into(),
+            "message".into(),
+            false,
+            false,
+            Some("parsed".to_string()),
+        );
+
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
-        
+
         Box::new(t).run(rx_in, tx_out).await;
-        
+
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
 
@@ -212,7 +235,7 @@ mod tests {
             Some(Value::String(s)) => assert_eq!(s, "2024-01-02T03:04:05Z"),
             _ => panic!("expected string"),
         }
-        assert!(log.fields.get("a").is_none());
+        assert!(!log.fields.contains_key("a"));
     }
 
     #[tokio::test]
@@ -220,16 +243,16 @@ mod tests {
         let mut event = Event::new();
         event.insert("message", "{invalid json".to_string());
         let envelope = EventEnvelope::new(event);
-        
+
         let t = JsonParseTransform::new("test".into(), "message".into(), true, false, None);
-        
+
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
-        
+
         Box::new(t).run(rx_in, tx_out).await;
-        
+
         assert!(rx_out.recv().await.is_none());
     }
 }

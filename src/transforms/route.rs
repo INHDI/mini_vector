@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use metrics;
+use std::collections::BTreeMap;
 use tokio::sync::mpsc;
-use vrl::compiler::{self, runtime::Runtime, state::RuntimeState, TargetValueRef, TimeZone};
+use vrl::compiler::{self, TargetValueRef, TimeZone, runtime::Runtime, state::RuntimeState};
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
-use std::collections::BTreeMap;
 
-use crate::event::{Event, EventEnvelope, Value, LogEvent};
+use crate::event::{Event, EventEnvelope, LogEvent, Value};
 use crate::transforms::Transform;
 
 pub struct RouteRule {
@@ -23,7 +23,11 @@ pub struct RouteTransform {
 }
 
 impl RouteTransform {
-    pub fn new(name: String, routes_cfg: Vec<(String, String, Vec<String>)>, default_outputs: Vec<String>) -> anyhow::Result<Self> {
+    pub fn new(
+        name: String,
+        routes_cfg: Vec<(String, String, Vec<String>)>,
+        default_outputs: Vec<String>,
+    ) -> anyhow::Result<Self> {
         let mut routes = Vec::new();
         for (route_name, condition, outputs) in routes_cfg {
             let wrapped = format!(".matched = ({})", condition);
@@ -56,12 +60,14 @@ impl RouteTransform {
         };
         let tz = TimeZone::default();
 
-        if rule.runtime.resolve(&mut target, &rule.program, &tz).is_ok() {
-            if let VrlValue::Object(obj) = v {
-                if let Some(VrlValue::Boolean(b)) = obj.get(&KeyString::from("matched")) {
-                    return Ok(*b);
-                }
-            }
+        if rule
+            .runtime
+            .resolve(&mut target, &rule.program, &tz)
+            .is_ok()
+            && let VrlValue::Object(obj) = v
+            && let Some(VrlValue::Boolean(b)) = obj.get(&KeyString::from("matched"))
+        {
+            return Ok(*b);
         }
         Ok(false)
     }
@@ -86,7 +92,10 @@ impl Transform for RouteTransform {
                         for target in &rule.outputs {
                             let mut ev_clone = event.clone();
                             let Event::Log(LogEvent { fields }) = &mut ev_clone.event;
-                            fields.insert("__route_target".to_string(), Value::String(target.clone()));
+                            fields.insert(
+                                "__route_target".to_string(),
+                                Value::String(target.clone()),
+                            );
                             match output.send(ev_clone).await {
                                 Ok(_) => {
                                     metrics::increment_counter!(
@@ -183,7 +192,7 @@ fn to_vrl_value(v: &Value) -> VrlValue {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn event_with_type(ty: &str) -> EventEnvelope {
         let mut ev = Event::new();
@@ -193,27 +202,39 @@ mod tests {
 
     #[tokio::test]
     async fn routes_to_named_output_and_default() {
-        let routes_cfg = vec![("web".to_string(), ".log_type == \"web\"".to_string(), vec!["web_out".to_string()])];
+        let routes_cfg = vec![(
+            "web".to_string(),
+            ".log_type == \"web\"".to_string(),
+            vec!["web_out".to_string()],
+        )];
         let default_outputs = vec!["fallback".to_string()];
         let t = RouteTransform::new("router".into(), routes_cfg, default_outputs).unwrap();
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
 
-        tokio::spawn(async move { Box::new(t).run(rx_in, tx_out).await; });
+        tokio::spawn(async move {
+            Box::new(t).run(rx_in, tx_out).await;
+        });
 
         tx_in.send(event_with_type("web")).await.unwrap();
         tx_in.send(event_with_type("other")).await.unwrap();
         drop(tx_in);
 
         let mut targets = Vec::new();
-        let first = timeout(Duration::from_millis(200), rx_out.recv()).await.unwrap().unwrap();
+        let first = timeout(Duration::from_millis(200), rx_out.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let Event::Log(log) = &first.event;
         if let Some(Value::String(t)) = log.fields.get("__route_target") {
             targets.push(t.clone());
         }
 
-        let second = timeout(Duration::from_millis(200), rx_out.recv()).await.unwrap().unwrap();
+        let second = timeout(Duration::from_millis(200), rx_out.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let Event::Log(log2) = &second.event;
         if let Some(Value::String(t)) = log2.fields.get("__route_target") {
             targets.push(t.clone());

@@ -1,9 +1,9 @@
 use async_trait::async_trait;
+use metrics;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn, error};
-use metrics;
+use tracing::{error, info, warn};
 
 use crate::event::{Event, EventEnvelope};
 use crate::sources::Source;
@@ -16,7 +16,11 @@ pub struct TcpSource {
 
 impl TcpSource {
     pub fn new(name: String, address: String, max_length: usize) -> Self {
-        Self { name, address, max_length }
+        Self {
+            name,
+            address,
+            max_length,
+        }
     }
 
     async fn handle_conn(
@@ -25,7 +29,11 @@ impl TcpSource {
         tx: mpsc::Sender<EventEnvelope>,
         mut shutdown: broadcast::Receiver<()>,
     ) {
-        let peer = stream.peer_addr().ok().map(|p| p.to_string()).unwrap_or_else(|| "unknown".into());
+        let peer = stream
+            .peer_addr()
+            .ok()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".into());
         let (read_half, _) = tokio::io::split(stream);
         let reader = tokio::io::BufReader::new(read_half);
         let mut lines = reader.lines();
@@ -70,7 +78,10 @@ impl Source for TcpSource {
         let listener = match TcpListener::bind(&self.address).await {
             Ok(l) => l,
             Err(err) => {
-                error!("TcpSource[{}] failed to bind {}: {}", self.name, self.address, err);
+                error!(
+                    "TcpSource[{}] failed to bind {}: {}",
+                    self.name, self.address, err
+                );
                 return;
             }
         };

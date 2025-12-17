@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -22,8 +22,7 @@ impl HealthState {
     }
 
     pub fn mark_opensearch_ok(&self) {
-        self.last_opensearch_ok
-            .store(now_secs(), Ordering::Relaxed);
+        self.last_opensearch_ok.store(now_secs(), Ordering::Relaxed);
     }
 
     pub fn is_healthy(&self, threshold_secs: i64) -> bool {

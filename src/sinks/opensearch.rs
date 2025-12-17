@@ -1,20 +1,21 @@
 use async_trait::async_trait;
 use base64::Engine;
 use chrono::Utc;
+use metrics;
 use reqwest::Client;
+use std::collections::HashSet;
 use tokio::time::Duration;
 use tracing::{info, warn};
-use metrics;
-use std::collections::HashSet;
 
 use crate::batcher::{Batch, Batcher};
 use crate::config::{
-    BatchConfig, OpenSearchAuthConfig, OpenSearchBulkConfig, OpenSearchRetryConfig, OpenSearchTlsConfig,
+    BatchConfig, OpenSearchAuthConfig, OpenSearchBulkConfig, OpenSearchRetryConfig,
+    OpenSearchTlsConfig,
 };
 use crate::event::{Event, EventEnvelope, Value};
+use crate::health::HealthState;
 use crate::queue::SinkReceiver;
 use crate::sinks::Sink;
-use crate::health::HealthState;
 
 #[derive(Clone)]
 pub struct OpenSearchSink {
@@ -39,6 +40,7 @@ struct BulkAttemptResult {
 }
 
 impl OpenSearchSink {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         endpoints: Vec<String>,
@@ -71,7 +73,7 @@ impl OpenSearchSink {
             auth,
             _tls: tls,
             batch_config,
-            retry: retry.unwrap_or_else(|| OpenSearchRetryConfig {
+            retry: retry.unwrap_or(OpenSearchRetryConfig {
                 attempts: 3,
                 backoff_secs: 1,
                 max_backoff_secs: 3,
@@ -104,7 +106,9 @@ impl OpenSearchSink {
                 }
                 serde_json::Value::Object(m)
             }
-            Value::Bytes(b) => serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
+            Value::Bytes(b) => {
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+            }
         }
     }
 
@@ -115,11 +119,11 @@ impl OpenSearchSink {
                 for (k, v) in log.fields {
                     let mut val = v;
                     // ensure timestamp string
-                    if k == "@timestamp" {
-                        if let Value::Timestamp(ts) = &val {
-                            let s = ts.to_rfc3339();
-                            val = Value::String(s);
-                        }
+                    if k == "@timestamp"
+                        && let Value::Timestamp(ts) = &val
+                    {
+                        let s = ts.to_rfc3339();
+                        val = Value::String(s);
                     }
                     m.insert(k, Self::value_to_json(&val));
                 }
@@ -142,11 +146,7 @@ impl OpenSearchSink {
         body
     }
 
-    async fn send_bulk_once(
-        &self,
-        events: &[EventEnvelope],
-        body: &str,
-    ) -> BulkAttemptResult {
+    async fn send_bulk_once(&self, events: &[EventEnvelope], body: &str) -> BulkAttemptResult {
         let mut result = BulkAttemptResult {
             success: Vec::new(),
             retryable: Vec::new(),
@@ -161,12 +161,11 @@ impl OpenSearchSink {
             .post(endpoint)
             .header("Content-Type", "application/json");
 
-        if let Some(auth) = &self.auth {
-            if auth.strategy == "basic" {
-                if let (Some(user), Some(pw)) = (&auth.user, &auth.password) {
-                    base_req = base_req.basic_auth(user, Some(pw));
-                }
-            }
+        if let Some(auth) = &self.auth
+            && auth.strategy == "basic"
+            && let (Some(user), Some(pw)) = (&auth.user, &auth.password)
+        {
+            base_req = base_req.basic_auth(user, Some(pw));
         }
 
         let req = match base_req.try_clone() {
@@ -221,8 +220,7 @@ impl OpenSearchSink {
                 }
 
                 if items.len() < events.len() {
-                    result.retryable
-                        .extend(items.len()..events.len());
+                    result.retryable.extend(items.len()..events.len());
                 }
             }
             Err(err) => {
@@ -330,10 +328,10 @@ impl OpenSearchSink {
             backoff = (backoff * 2).min(self.retry.max_backoff_secs);
         }
 
-        if let Some(res) = last_result {
-            if res.had_errors || res.status.map(|s| s.is_client_error()).unwrap_or(false) {
-                metrics::increment_counter!("batches_failed", "component" => self.name.clone());
-            }
+        if let Some(res) = last_result
+            && (res.had_errors || res.status.map(|s| s.is_client_error()).unwrap_or(false))
+        {
+            metrics::increment_counter!("batches_failed", "component" => self.name.clone());
         }
     }
 }

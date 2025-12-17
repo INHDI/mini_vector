@@ -266,18 +266,20 @@ fn default_buffer_timeout_secs() -> u64 {
     1
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WhenFull {
+    #[default]
     Block,
     DropNew,
     DropOldest,
     SpillToDisk,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueType {
+    #[default]
     InMemory,
     Disk,
 }
@@ -287,18 +289,6 @@ pub enum QueueType {
 pub enum ReadFrom {
     Beginning,
     End,
-}
-
-impl Default for QueueType {
-    fn default() -> Self {
-        QueueType::InMemory
-    }
-}
-
-impl Default for WhenFull {
-    fn default() -> Self {
-        WhenFull::Block
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,15 +319,14 @@ impl FullConfig {
                     if s.include.is_empty() {
                         anyhow::bail!("source '{}' (file) missing 'include'", name);
                     }
-                    if let Some(flush) = s.state_flush_secs {
-                        if flush == 0 {
-                            anyhow::bail!("source '{}' (file) state_flush_secs must be > 0", name);
-                        }
+                    if let Some(flush) = s.state_flush_secs && flush == 0 {
+                        anyhow::bail!("source '{}' (file) state_flush_secs must be > 0", name);
                     }
-                    if let Some(scan) = s.scan_interval_secs {
-                        if scan == 0 {
-                            anyhow::bail!("source '{}' (file) scan_interval_secs must be > 0", name);
-                        }
+                    if let Some(scan) = s.scan_interval_secs && scan == 0 {
+                        anyhow::bail!(
+                            "source '{}' (file) scan_interval_secs must be > 0",
+                            name
+                        );
                     }
                 }
                 "syslog" => {
@@ -416,7 +405,10 @@ impl FullConfig {
                             anyhow::bail!("transform '{}' (remap) missing 'source'", name);
                         }
                         let drop_on_error = t.drop_on_error.unwrap_or(true);
-                        let error_field = t.error_field.clone().unwrap_or_else(|| "remap_error".to_string());
+                        let error_field = t
+                            .error_field
+                            .clone()
+                            .unwrap_or_else(|| "remap_error".to_string());
                         if !drop_on_error && error_field.trim().is_empty() {
                             anyhow::bail!(
                                 "transform '{}' (remap) requires non-empty 'error_field' when drop_on_error=false",
@@ -425,16 +417,31 @@ impl FullConfig {
                         }
                     }
                     "route" => {
-                        let routes = t.routes.as_ref().ok_or_else(|| anyhow::anyhow!("transform '{}' (route) missing 'routes'", name))?;
+                        let routes = t.routes.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("transform '{}' (route) missing 'routes'", name)
+                        })?;
                         if routes.is_empty() {
-                            anyhow::bail!("transform '{}' (route) requires at least one route", name);
+                            anyhow::bail!(
+                                "transform '{}' (route) requires at least one route",
+                                name
+                            );
                         }
                         for (rname, rcfg) in routes {
                             if rcfg.outputs.is_empty() {
-                                anyhow::bail!("transform '{}' (route) route '{}' requires non-empty outputs", name, rname);
+                                anyhow::bail!(
+                                    "transform '{}' (route) route '{}' requires non-empty outputs",
+                                    name,
+                                    rname
+                                );
                             }
-                            if rcfg.condition.as_deref().unwrap_or("").is_empty() && rname != "default" {
-                                anyhow::bail!("transform '{}' (route) route '{}' missing 'condition'", name, rname);
+                            if rcfg.condition.as_deref().unwrap_or("").is_empty()
+                                && rname != "default"
+                            {
+                                anyhow::bail!(
+                                    "transform '{}' (route) route '{}' missing 'condition'",
+                                    name,
+                                    rname
+                                );
                             }
                         }
                     }
@@ -454,16 +461,16 @@ impl FullConfig {
             .as_ref()
             .map(|t| t.values().any(|cfg| !cfg.inputs.is_empty()))
             .unwrap_or(false)
-            || self
-                .sinks
-                .values()
-                .any(|cfg| !cfg.inputs.is_empty());
+            || self.sinks.values().any(|cfg| !cfg.inputs.is_empty());
 
         if has_inputs {
             if let Some(transforms) = &self.transforms {
                 for (name, t) in transforms {
                     if t.inputs.is_empty() {
-                        anyhow::bail!("transform '{}' uses inputs mode but 'inputs' is empty", name);
+                        anyhow::bail!(
+                            "transform '{}' uses inputs mode but 'inputs' is empty",
+                            name
+                        );
                     }
                     for inp in &t.inputs {
                         if !node_names.contains(inp) {
@@ -475,7 +482,10 @@ impl FullConfig {
 
             for (sink_name, sink_cfg) in &self.sinks {
                 if sink_cfg.inputs.is_empty() {
-                    anyhow::bail!("sink '{}' uses inputs mode but 'inputs' is empty", sink_name);
+                    anyhow::bail!(
+                        "sink '{}' uses inputs mode but 'inputs' is empty",
+                        sink_name
+                    );
                 }
                 for inp in &sink_cfg.inputs {
                     if !node_names.contains(inp) {
@@ -509,34 +519,54 @@ impl FullConfig {
 
             if sink_cfg.kind == "opensearch" || sink_cfg.kind == "elasticsearch" {
                 if sink_cfg.endpoints.is_empty() {
-                    anyhow::bail!("sink '{}' (opensearch) requires non-empty endpoints", sink_name);
+                    anyhow::bail!(
+                        "sink '{}' (opensearch) requires non-empty endpoints",
+                        sink_name
+                    );
                 }
                 let mode = sink_cfg.mode.clone().unwrap_or_else(|| "bulk".to_string());
                 if mode != "bulk" {
-                    anyhow::bail!("sink '{}' (opensearch) only supports mode='bulk' for now", sink_name);
+                    anyhow::bail!(
+                        "sink '{}' (opensearch) only supports mode='bulk' for now",
+                        sink_name
+                    );
                 }
-                let bulk = sink_cfg
-                    .bulk
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("sink '{}' (opensearch) missing bulk config", sink_name))?;
+                let bulk = sink_cfg.bulk.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("sink '{}' (opensearch) missing bulk config", sink_name)
+                })?;
                 if bulk.index.trim().is_empty() {
-                    anyhow::bail!("sink '{}' (opensearch) bulk.index cannot be empty", sink_name);
+                    anyhow::bail!(
+                        "sink '{}' (opensearch) bulk.index cannot be empty",
+                        sink_name
+                    );
                 }
 
                 if let Some(retry) = &sink_cfg.retry {
                     if retry.attempts == 0 {
-                        anyhow::bail!("sink '{}' (opensearch) retry.attempts must be >= 1", sink_name);
+                        anyhow::bail!(
+                            "sink '{}' (opensearch) retry.attempts must be >= 1",
+                            sink_name
+                        );
                     }
                     if retry.backoff_secs == 0 {
-                        anyhow::bail!("sink '{}' (opensearch) retry.backoff_secs must be >= 1", sink_name);
+                        anyhow::bail!(
+                            "sink '{}' (opensearch) retry.backoff_secs must be >= 1",
+                            sink_name
+                        );
                     }
                     if retry.max_backoff_secs < retry.backoff_secs {
-                        anyhow::bail!("sink '{}' (opensearch) retry.max_backoff_secs must be >= backoff_secs", sink_name);
+                        anyhow::bail!(
+                            "sink '{}' (opensearch) retry.max_backoff_secs must be >= backoff_secs",
+                            sink_name
+                        );
                     }
                 }
             }
             if sink_cfg.kind == "file" {
-                let path = sink_cfg.path.as_ref().ok_or_else(|| anyhow::anyhow!("sink '{}' (file) missing path", sink_name))?;
+                let path = sink_cfg
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("sink '{}' (file) missing path", sink_name))?;
                 if path.trim().is_empty() {
                     anyhow::bail!("sink '{}' (file) path cannot be empty", sink_name);
                 }
@@ -556,7 +586,7 @@ impl FullConfig {
                     }
                 }
             }
-            for (_, sink_cfg) in &self.sinks {
+            for sink_cfg in self.sinks.values() {
                 for inp in &sink_cfg.inputs {
                     has_downstream.insert(inp.clone());
                 }

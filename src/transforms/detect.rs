@@ -6,11 +6,11 @@ use async_trait::async_trait;
 use metrics;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use vrl::compiler::{self, runtime::Runtime, state::RuntimeState, TargetValueRef, TimeZone};
+use vrl::compiler::{self, TargetValueRef, TimeZone, runtime::Runtime, state::RuntimeState};
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
 
-use crate::event::{Event, EventEnvelope, Value, LogEvent};
+use crate::event::{Event, EventEnvelope, LogEvent, Value};
 use crate::transforms::Transform;
 
 #[derive(Debug, Deserialize)]
@@ -41,7 +41,11 @@ pub struct DetectTransform {
 }
 
 impl DetectTransform {
-    pub fn from_rules_file(name: String, path: &str, alert_outputs: Vec<String>) -> anyhow::Result<Self> {
+    pub fn from_rules_file(
+        name: String,
+        path: &str,
+        alert_outputs: Vec<String>,
+    ) -> anyhow::Result<Self> {
         let f = File::open(Path::new(path))?;
         let rules: Vec<DetectRule> = serde_yaml::from_reader(f)?;
         if rules.is_empty() {
@@ -59,7 +63,11 @@ impl DetectTransform {
                 runtime: Runtime::new(RuntimeState::default()),
             });
         }
-        Ok(Self { name, rules: compiled, alert_outputs })
+        Ok(Self {
+            name,
+            rules: compiled,
+            alert_outputs,
+        })
     }
 
     fn event_to_vrl(event: &Event) -> VrlValue {
@@ -85,10 +93,10 @@ impl DetectTransform {
         };
         let tz = TimeZone::default();
         rule.runtime.resolve(&mut target, &rule.program, &tz)?;
-        if let VrlValue::Object(obj) = target.value {
-            if let Some(VrlValue::Boolean(b)) = obj.get(&KeyString::from("matched")) {
-                return Ok(*b);
-            }
+        if let VrlValue::Object(obj) = target.value
+            && let Some(VrlValue::Boolean(b)) = obj.get(&KeyString::from("matched"))
+        {
+            return Ok(*b);
         }
         Ok(false)
     }
@@ -109,10 +117,19 @@ impl Transform for DetectTransform {
                         let Event::Log(LogEvent { fields }) = &mut event.event;
                         fields.insert("alert".to_string(), Value::Bool(true));
                         fields.insert("rule_id".to_string(), Value::String(rule.meta.id.clone()));
-                        fields.insert("rule_name".to_string(), Value::String(rule.meta.name.clone()));
-                        fields.insert("alert_severity".to_string(), Value::String(rule.meta.severity.clone()));
+                        fields.insert(
+                            "rule_name".to_string(),
+                            Value::String(rule.meta.name.clone()),
+                        );
+                        fields.insert(
+                            "alert_severity".to_string(),
+                            Value::String(rule.meta.severity.clone()),
+                        );
                         if !rule.meta.description.is_empty() {
-                            fields.insert("rule_description".to_string(), Value::String(rule.meta.description.clone()));
+                            fields.insert(
+                                "rule_description".to_string(),
+                                Value::String(rule.meta.description.clone()),
+                            );
                         }
                         metrics::increment_counter!(
                             "alerts_fired",
@@ -122,7 +139,10 @@ impl Transform for DetectTransform {
                         for target in &self.alert_outputs {
                             let mut cloned = event.clone();
                             let Event::Log(LogEvent { fields }) = &mut cloned.event;
-                            fields.insert("__route_target".to_string(), Value::String(target.clone()));
+                            fields.insert(
+                                "__route_target".to_string(),
+                                Value::String(target.clone()),
+                            );
                             if let Err(err) = output.send(cloned).await {
                                 err.0.ack.ack();
                             }
@@ -143,7 +163,9 @@ impl Transform for DetectTransform {
             }
 
             match output.send(event).await {
-                Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                Ok(_) => {
+                    metrics::increment_counter!("events_out", "component" => self.name.clone())
+                }
                 Err(err) => {
                     err.0.ack.ack();
                     break;
@@ -177,7 +199,7 @@ fn to_vrl_value(v: &Value) -> VrlValue {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn write_rules(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -195,11 +217,18 @@ mod tests {
   condition: '.foo == "bar"'
 "#,
         );
-        let t = DetectTransform::from_rules_file("detect".into(), file.path().to_str().unwrap(), Vec::new()).unwrap();
+        let t = DetectTransform::from_rules_file(
+            "detect".into(),
+            file.path().to_str().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
-        tokio::spawn(async move { Box::new(t).run(rx_in, tx_out).await; });
+        tokio::spawn(async move {
+            Box::new(t).run(rx_in, tx_out).await;
+        });
 
         let mut ev = Event::new();
         ev.insert("foo", "bar");
@@ -213,8 +242,14 @@ mod tests {
         let log = out.event.as_log().unwrap();
         assert_eq!(log.fields.get("alert"), Some(&Value::Bool(true)));
         assert_eq!(log.fields.get("rule_id"), Some(&Value::String("T1".into())));
-        assert_eq!(log.fields.get("rule_name"), Some(&Value::String("Test Rule".into())));
-        assert_eq!(log.fields.get("alert_severity"), Some(&Value::String("high".into())));
+        assert_eq!(
+            log.fields.get("rule_name"),
+            Some(&Value::String("Test Rule".into()))
+        );
+        assert_eq!(
+            log.fields.get("alert_severity"),
+            Some(&Value::String("high".into()))
+        );
     }
 
     #[tokio::test]
@@ -226,11 +261,18 @@ mod tests {
   condition: '.foo == "bar"'
 "#,
         );
-        let t = DetectTransform::from_rules_file("detect".into(), file.path().to_str().unwrap(), Vec::new()).unwrap();
+        let t = DetectTransform::from_rules_file(
+            "detect".into(),
+            file.path().to_str().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
-        tokio::spawn(async move { Box::new(t).run(rx_in, tx_out).await; });
+        tokio::spawn(async move {
+            Box::new(t).run(rx_in, tx_out).await;
+        });
 
         let mut ev = Event::new();
         ev.insert("foo", "baz");

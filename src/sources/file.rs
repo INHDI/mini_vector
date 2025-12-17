@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use anyhow;
+use async_trait::async_trait;
 use glob::glob;
 use metrics;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{interval, Instant};
+use tokio::time::{Instant, interval};
 use tracing::{error, info, warn};
 
 use crate::config::{ReadFrom, SourceConfig};
@@ -59,18 +59,20 @@ impl FileStateStore {
         Ok(map)
     }
 
-    fn save(&self, state: &FileState) -> anyhow::Result<()> {
+    fn save(&mut self, state: &FileState) -> anyhow::Result<()> {
         let key = Self::encode_key(state.dev, state.inode);
         let val = serde_json::to_vec(state)?;
         self.db.insert(key, val)?;
         if self.last_flush.elapsed() >= self.flush_interval {
             self.db.flush()?;
+            self.last_flush = Instant::now();
         }
         Ok(())
     }
 
     fn flush(&self) -> anyhow::Result<()> {
         self.db.flush()?;
+        // best-effort update when called explicitly
         Ok(())
     }
 
@@ -148,10 +150,13 @@ impl Source for FileSource {
             self.name, self.include
         );
 
-        let store = match FileStateStore::open(&self.state_path, self.flush_interval) {
+        let mut store = match FileStateStore::open(&self.state_path, self.flush_interval) {
             Ok(s) => s,
             Err(err) => {
-                error!("FileSource[{}] failed to open state store: {}", self.name, err);
+                error!(
+                    "FileSource[{}] failed to open state store: {}",
+                    self.name, err
+                );
                 return;
             }
         };
@@ -192,7 +197,7 @@ impl Source for FileSource {
             &mut tracked,
             &mut path_index,
             &mut state_cache,
-            &store,
+            &mut store,
             self.read_from,
             self.fingerprint_bytes,
         )
@@ -232,7 +237,7 @@ impl Source for FileSource {
                                     &mut tracked,
                                     &mut path_index,
                                     &mut state_cache,
-                                    &store,
+                                    &mut store,
                                     self.read_from,
                                     self.fingerprint_bytes,
                                 )
@@ -241,7 +246,7 @@ impl Source for FileSource {
                                     warn!("FileSource[{}] refresh {:?} failed: {}", self.name, path, err);
                                 }
                                 if let Some(key) = path_index.get(&path).copied() {
-                                    read_new_lines(&self.name, &path, key, &mut tracked, &tx, &store, &mut state_cache).await;
+                                    read_new_lines(&self.name, &path, key, &mut tracked, &tx, &mut store, &mut state_cache).await;
                                 }
                             }
                         }
@@ -256,7 +261,7 @@ impl Source for FileSource {
                         &mut tracked,
                         &mut path_index,
                         &mut state_cache,
-                        &store,
+                        &mut store,
                         self.read_from,
                         self.fingerprint_bytes,
                     ).await {
@@ -276,13 +281,14 @@ impl Source for FileSource {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn initial_scan(
     patterns: &[String],
     watcher: &mut RecommendedWatcher,
     tracked: &mut HashMap<(u64, u64), TrackedFile>,
     path_index: &mut HashMap<PathBuf, (u64, u64)>,
     state_cache: &mut HashMap<(u64, u64), FileState>,
-    store: &FileStateStore,
+    store: &mut FileStateStore,
     read_from: ReadFrom,
     fingerprint_bytes: usize,
 ) -> anyhow::Result<()> {
@@ -315,13 +321,14 @@ async fn initial_scan(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rescan_patterns(
     patterns: &[String],
     watcher: &mut RecommendedWatcher,
     tracked: &mut HashMap<(u64, u64), TrackedFile>,
     path_index: &mut HashMap<PathBuf, (u64, u64)>,
     state_cache: &mut HashMap<(u64, u64), FileState>,
-    store: &FileStateStore,
+    store: &mut FileStateStore,
     read_from: ReadFrom,
     fingerprint_bytes: usize,
 ) -> anyhow::Result<()> {
@@ -338,13 +345,14 @@ async fn rescan_patterns(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn refresh_path(
     path: &Path,
     watcher: &mut RecommendedWatcher,
     tracked: &mut HashMap<(u64, u64), TrackedFile>,
     path_index: &mut HashMap<PathBuf, (u64, u64)>,
     state_cache: &mut HashMap<(u64, u64), FileState>,
-    store: &FileStateStore,
+    store: &mut FileStateStore,
     read_from: ReadFrom,
     fingerprint_bytes: usize,
 ) -> anyhow::Result<()> {
@@ -417,7 +425,10 @@ async fn refresh_path(
     store.save(&state)?;
     state_cache.insert(key, state);
 
-    info!("Tracking file {:?} (dev={}, inode={}, offset={})", path, dev, inode, offset);
+    info!(
+        "Tracking file {:?} (dev={}, inode={}, offset={})",
+        path, dev, inode, offset
+    );
     Ok(())
 }
 
@@ -427,18 +438,21 @@ async fn read_new_lines(
     key: (u64, u64),
     tracked: &mut HashMap<(u64, u64), TrackedFile>,
     tx: &mpsc::Sender<EventEnvelope>,
-    store: &FileStateStore,
+    store: &mut FileStateStore,
     state_cache: &mut HashMap<(u64, u64), FileState>,
 ) {
     let Some(file) = tracked.get_mut(&key) else {
         return;
     };
 
-    // Check for truncate
-    let meta = match std::fs::metadata(&file.path) {
+    // Check for truncate using file handle to survive renames
+    let meta = match file.reader.get_ref().metadata() {
         Ok(m) => m,
         Err(err) => {
-            warn!("FileSource[{}] stat failed for {:?}: {}", component, file.path, err);
+            warn!(
+                "FileSource[{}] stat failed for {:?}: {}",
+                component, file.path, err
+            );
             return;
         }
     };
@@ -466,7 +480,10 @@ async fn read_new_lines(
 
                 let mut event = Event::new();
                 event.insert("message".to_string(), Value::from(line.clone()));
-                event.insert("source".to_string(), Value::from(path.to_string_lossy().to_string()));
+                event.insert(
+                    "source".to_string(),
+                    Value::from(path.to_string_lossy().to_string()),
+                );
                 event.insert("log_type".to_string(), Value::from("file"));
 
                 let envelope = EventEnvelope::with_source(event, component.to_string());

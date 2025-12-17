@@ -5,9 +5,9 @@ use crate::event::EventEnvelope;
 
 pub mod file;
 pub mod http;
+pub mod stdin;
 pub mod syslog;
 pub mod tcp;
-pub mod stdin;
 
 #[async_trait]
 pub trait Source: Send + Sync {

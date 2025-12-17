@@ -5,13 +5,13 @@ use crate::event::EventEnvelope;
 
 pub mod add_field;
 pub mod contains_filter;
+pub mod detect;
 pub mod json_parse;
 pub mod normalize_schema;
 pub mod regex_parse;
-pub mod script;
 pub mod remap;
 pub mod route;
-pub mod detect;
+pub mod script;
 
 #[async_trait]
 pub trait Transform: Send + Sync {

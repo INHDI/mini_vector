@@ -12,17 +12,15 @@ mod transforms;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use tracing::{info, warn};
 
-use crate::reload::PipelineManager;
 use crate::health::HealthState;
+use crate::reload::PipelineManager;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     // Initialize Prometheus metrics
     // We install the recorder but manage the HTTP server ourselves to add /health
@@ -42,10 +40,13 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let app = Router::new()
             .route("/metrics", get(move || std::future::ready(handle.render())))
-            .route("/health", get(move || {
-                let healthy = health_clone.is_healthy(60);
-                async move { if healthy { "UP" } else { "DOWN" } }
-            }));
+            .route(
+                "/health",
+                get(move || {
+                    let healthy = health_clone.is_healthy(60);
+                    async move { if healthy { "UP" } else { "DOWN" } }
+                }),
+            );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
         info!("Metrics and Health API listening on {}", addr);

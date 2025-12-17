@@ -1,9 +1,9 @@
 use async_trait::async_trait;
+use chrono::Utc;
+use metrics;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn, error};
-use metrics;
-use chrono::Utc;
+use tracing::{error, info, warn};
 
 use crate::event::EventEnvelope;
 use crate::queue::SinkReceiver;
@@ -20,10 +20,18 @@ pub struct FileSink {
 impl FileSink {
     pub async fn new(name: String, path: String, max_bytes: u64) -> anyhow::Result<Self> {
         let (writer, current_bytes) = Self::open_writer(&path).await?;
-        Ok(Self { name, path, max_bytes, current_bytes, writer })
+        Ok(Self {
+            name,
+            path,
+            max_bytes,
+            current_bytes,
+            writer,
+        })
     }
 
-    async fn open_writer(path: &str) -> anyhow::Result<(tokio::io::BufWriter<tokio::fs::File>, u64)> {
+    async fn open_writer(
+        path: &str,
+    ) -> anyhow::Result<(tokio::io::BufWriter<tokio::fs::File>, u64)> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
