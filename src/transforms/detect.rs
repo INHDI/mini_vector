@@ -10,7 +10,7 @@ use vrl::compiler::{self, runtime::Runtime, state::RuntimeState, TargetValueRef,
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
 
-use crate::event::{Event, Value, LogEvent};
+use crate::event::{Event, EventEnvelope, Value, LogEvent};
 use crate::transforms::Transform;
 
 #[derive(Debug, Deserialize)]
@@ -96,13 +96,17 @@ impl DetectTransform {
 
 #[async_trait]
 impl Transform for DetectTransform {
-    async fn run(mut self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
+    async fn run(
+        mut self: Box<Self>,
+        mut input: mpsc::Receiver<EventEnvelope>,
+        output: mpsc::Sender<EventEnvelope>,
+    ) {
         while let Some(mut event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
             for rule in &mut self.rules {
-                match Self::apply_rule(rule, &event) {
+                match Self::apply_rule(rule, &event.event) {
                     Ok(true) => {
-                        let Event::Log(LogEvent { fields }) = &mut event;
+                        let Event::Log(LogEvent { fields }) = &mut event.event;
                         fields.insert("alert".to_string(), Value::Bool(true));
                         fields.insert("rule_id".to_string(), Value::String(rule.meta.id.clone()));
                         fields.insert("rule_name".to_string(), Value::String(rule.meta.name.clone()));
@@ -117,10 +121,10 @@ impl Transform for DetectTransform {
                         );
                         for target in &self.alert_outputs {
                             let mut cloned = event.clone();
-                            let Event::Log(LogEvent { fields }) = &mut cloned;
+                            let Event::Log(LogEvent { fields }) = &mut cloned.event;
                             fields.insert("__route_target".to_string(), Value::String(target.clone()));
-                            if output.send(cloned).await.is_err() {
-                                break;
+                            if let Err(err) = output.send(cloned).await {
+                                err.0.ack.ack();
                             }
                             metrics::increment_counter!("events_out", "component" => self.name.clone());
                         }
@@ -138,10 +142,13 @@ impl Transform for DetectTransform {
                 }
             }
 
-            if output.send(event).await.is_err() {
-                break;
+            match output.send(event).await {
+                Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                Err(err) => {
+                    err.0.ack.ack();
+                    break;
+                }
             }
-            metrics::increment_counter!("events_out", "component" => self.name.clone());
         }
     }
 }
@@ -196,14 +203,14 @@ mod tests {
 
         let mut ev = Event::new();
         ev.insert("foo", "bar");
-        tx_in.send(ev).await.unwrap();
+        tx_in.send(EventEnvelope::new(ev)).await.unwrap();
         drop(tx_in);
 
         let out = timeout(Duration::from_millis(200), rx_out.recv())
             .await
             .unwrap()
             .unwrap();
-        let log = out.as_log().unwrap();
+        let log = out.event.as_log().unwrap();
         assert_eq!(log.fields.get("alert"), Some(&Value::Bool(true)));
         assert_eq!(log.fields.get("rule_id"), Some(&Value::String("T1".into())));
         assert_eq!(log.fields.get("rule_name"), Some(&Value::String("Test Rule".into())));
@@ -227,14 +234,14 @@ mod tests {
 
         let mut ev = Event::new();
         ev.insert("foo", "baz");
-        tx_in.send(ev).await.unwrap();
+        tx_in.send(EventEnvelope::new(ev)).await.unwrap();
         drop(tx_in);
 
         let out = timeout(Duration::from_millis(200), rx_out.recv())
             .await
             .unwrap()
             .unwrap();
-        let log = out.as_log().unwrap();
+        let log = out.event.as_log().unwrap();
         assert!(!matches!(log.fields.get("alert"), Some(Value::Bool(true))));
     }
 }

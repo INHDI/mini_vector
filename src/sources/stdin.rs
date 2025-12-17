@@ -3,7 +3,7 @@ use metrics;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-use crate::event::Event;
+use crate::event::{Event, EventEnvelope};
 use crate::sources::Source;
 
 pub struct StdinSource {
@@ -18,7 +18,11 @@ impl StdinSource {
 
 #[async_trait]
 impl Source for StdinSource {
-    async fn run(self: Box<Self>, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
+    async fn run(
+        self: Box<Self>,
+        tx: mpsc::Sender<EventEnvelope>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
         use tokio::io::{self, AsyncBufReadExt};
 
         let stdin = io::stdin();
@@ -32,7 +36,9 @@ impl Source for StdinSource {
                         Ok(Some(line)) => {
                             let mut event = Event::new();
                             event.insert("message", line);
-                            if tx.send(event).await.is_err() {
+                            let envelope = EventEnvelope::with_source(event, self.name.clone());
+                            if let Err(err) = tx.send(envelope).await {
+                                err.0.ack.ack();
                                 break;
                             }
                             metrics::increment_counter!("events_out", "component" => self.name.clone());

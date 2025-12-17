@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 use tokio::sync::{broadcast, mpsc};
@@ -7,9 +7,10 @@ use tracing::{info, warn};
 use metrics;
 
 use crate::config::{
-    FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig, WhenFull,
+    FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig,
 };
-use crate::event::{Event, Value};
+use crate::event::{Event, EventEnvelope, Value};
+use crate::queue::{self, EnqueueStatus, SinkReceiver, SinkSender};
 // Router is deprecated in DAG mode, but we might keep it for legacy compat if we wanted to map it to a "RouterTransform"
 // use crate::router::{EventRouter, RouterConfig};
 use crate::sinks::console::ConsoleSink;
@@ -40,7 +41,7 @@ const DEFAULT_CHANNEL_SIZE: usize = 1024;
 fn build_source(name: &str, cfg: &SourceConfig) -> anyhow::Result<Box<dyn Source>> {
     match cfg.kind.as_str() {
         "stdin" => Ok(Box::new(StdinSource::new(name.to_string()))),
-        "file" => Ok(Box::new(FileSource::new(name.to_string(), cfg.include.clone()))),
+        "file" => Ok(Box::new(FileSource::new(name.to_string(), cfg.clone()))),
         "http" => {
             let addr_str = cfg
                 .address
@@ -268,17 +269,142 @@ async fn build_sink(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeKind {
+    Source,
+    Transform,
+    Sink,
+}
+
+#[derive(Clone, Debug)]
+struct Edge {
+    from: String,
+    to: String,
+}
+
+struct Graph {
+    nodes: HashMap<String, NodeKind>,
+    edges: Vec<Edge>,
+}
+
+#[derive(Clone)]
+enum EdgeSender {
+    Channel(mpsc::Sender<EventEnvelope>),
+    Sink(SinkSender),
+}
+
 #[derive(Clone)]
 struct Downstream {
     name: String,
-    tx: mpsc::Sender<Event>,
-    mode: WhenFull,
+    sender: EdgeSender,
 }
 
-async fn fan_out(event: Event, downstreams: &[Downstream]) {
+fn build_graph(config: &FullConfig) -> anyhow::Result<Graph> {
+    let mut nodes = HashMap::new();
+    for name in config.sources.keys() {
+        nodes.insert(name.clone(), NodeKind::Source);
+    }
+    if let Some(transforms) = &config.transforms {
+        for name in transforms.keys() {
+            nodes.insert(name.clone(), NodeKind::Transform);
+        }
+    }
+    for name in config.sinks.keys() {
+        nodes.insert(name.clone(), NodeKind::Sink);
+    }
+
+    let mut edges: Vec<Edge> = Vec::new();
+
+    if let Some(transforms) = &config.transforms {
+        for (name, cfg) in transforms {
+            for inp in &cfg.inputs {
+                edges.push(Edge {
+                    from: inp.clone(),
+                    to: name.clone(),
+                });
+            }
+            // route transform explicit outputs
+            if cfg.kind == "route" {
+                if let Some(routes) = &cfg.routes {
+                    for (_rname, rcfg) in routes {
+                        for out in &rcfg.outputs {
+                            edges.push(Edge {
+                                from: name.clone(),
+                                to: out.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (name, cfg) in &config.sinks {
+        if cfg.inputs.is_empty() {
+            anyhow::bail!("sink '{}' requires at least one input", name);
+        }
+        for inp in &cfg.inputs {
+            edges.push(Edge {
+                from: inp.clone(),
+                to: name.clone(),
+            });
+        }
+    }
+
+    // Validate nodes
+    for edge in &edges {
+        if !nodes.contains_key(&edge.from) {
+            anyhow::bail!("edge from unknown node '{}'", edge.from);
+        }
+        if !nodes.contains_key(&edge.to) {
+            anyhow::bail!("edge to unknown node '{}'", edge.to);
+        }
+    }
+
+    // Cycle detection (Kahn)
+    let mut incoming: HashMap<String, usize> = nodes.keys().map(|n| (n.clone(), 0)).collect();
+    for e in &edges {
+        *incoming.entry(e.to.clone()).or_default() += 1;
+    }
+
+    let mut queue: VecDeque<String> = incoming
+        .iter()
+        .filter_map(|(n, &deg)| if deg == 0 { Some(n.clone()) } else { None })
+        .collect();
+    let mut visited = 0;
+
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for e in &edges {
+        adj.entry(e.from.clone())
+            .or_default()
+            .push(e.to.clone());
+    }
+
+    while let Some(n) = queue.pop_front() {
+        visited += 1;
+        if let Some(neigh) = adj.get(&n) {
+            for m in neigh {
+                if let Some(entry) = incoming.get_mut(m) {
+                    *entry -= 1;
+                    if *entry == 0 {
+                        queue.push_back(m.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if visited != nodes.len() {
+        anyhow::bail!("cycle detected in pipeline graph");
+    }
+
+    Ok(Graph { nodes, edges })
+}
+
+async fn fan_out(event: EventEnvelope, downstreams: &[Downstream]) {
     let mut event = event;
     let mut target: Option<String> = None;
-    let Event::Log(log) = &mut event;
+    let Event::Log(log) = &mut event.event;
     if let Some(Value::String(route)) = log.fields.remove("__route_target") {
         target = Some(route);
     }
@@ -289,24 +415,43 @@ async fn fan_out(event: Event, downstreams: &[Downstream]) {
                 continue;
             }
         }
-        match ds.mode {
-            WhenFull::Block => {
-                if let Err(err) = ds.tx.send(event.clone()).await {
+        match &ds.sender {
+            EdgeSender::Channel(tx) => {
+                let cloned = event.clone();
+                if let Err(err) = tx.send(cloned).await {
                     warn!("downstream send failed: {}", err);
+                    event.ack.ack();
                 }
             }
-            WhenFull::DropNew => {
-                if let Err(err) = ds.tx.try_send(event.clone()) {
-                    warn!("downstream drop_new: {}", err);
+            EdgeSender::Sink(sender) => {
+                let cloned = event.clone();
+                if matches!(sender.send(cloned.clone()).await, EnqueueStatus::Dropped) {
                     metrics::increment_counter!(
                         "events_dropped",
                         "component" => ds.name.clone(),
                         "reason" => "buffer_full"
                     );
+                    cloned.ack.ack();
                 }
             }
         }
     }
+    event.ack.ack();
+}
+
+fn merge_inputs(inputs: Vec<mpsc::Receiver<EventEnvelope>>) -> mpsc::Receiver<EventEnvelope> {
+    let (tx, rx) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
+    for mut r in inputs {
+        let tx_clone = tx.clone();
+        task::spawn(async move {
+            while let Some(ev) = r.recv().await {
+                if tx_clone.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
 }
 
 pub async fn run_pipeline(
@@ -314,6 +459,8 @@ pub async fn run_pipeline(
     external_shutdown: Option<broadcast::Receiver<()>>,
     health: crate::health::HealthState,
 ) -> anyhow::Result<()> {
+    let graph = build_graph(&config)?;
+
     // Shutdown signal
     let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -336,23 +483,9 @@ pub async fn run_pipeline(
         });
     }
 
-    // If no inputs are defined, we technically have a disconnected graph,
-    // but we proceed anyway (maybe only sources running).
-    // The previous run_pipeline_linear is removed as it's incompatible with async Transform::run.
-    
-    // Build channels for transforms and sinks
-    let mut transform_channels: HashMap<String, mpsc::Sender<Event>> = HashMap::new();
-    let mut transform_receivers: HashMap<String, mpsc::Receiver<Event>> = HashMap::new();
-    if let Some(transforms) = &config.transforms {
-        for name in transforms.keys() {
-            let (tx, rx) = mpsc::channel::<Event>(DEFAULT_CHANNEL_SIZE);
-            transform_channels.insert(name.clone(), tx);
-            transform_receivers.insert(name.clone(), rx);
-        }
-    }
-
-    let mut sink_channels: HashMap<String, (mpsc::Sender<Event>, WhenFull)> = HashMap::new();
-    let mut sink_receivers: HashMap<String, mpsc::Receiver<Event>> = HashMap::new();
+    // Build sink queues
+    let mut sink_channels: HashMap<String, SinkSender> = HashMap::new();
+    let mut sink_receivers: HashMap<String, SinkReceiver> = HashMap::new();
     for (name, scfg) in &config.sinks {
         let buffer: SinkBufferConfig = scfg
             .buffer
@@ -361,67 +494,66 @@ pub async fn run_pipeline(
                 max_events: DEFAULT_CHANNEL_SIZE,
                 ..SinkBufferConfig::default()
             });
-        let (tx, rx) = mpsc::channel::<Event>(buffer.max_events);
-        sink_channels.insert(name.clone(), (tx, buffer.when_full));
+        let queue_path = buffer.queue_path.clone().map(|p| std::path::PathBuf::from(p));
+        let max_segment_bytes = if buffer.max_bytes > 0 {
+            buffer.max_bytes as u64
+        } else {
+            64 * 1024 * 1024
+        };
+        let (tx, rx) = queue::sink_queue(
+            name.clone(),
+            buffer.max_events,
+            buffer.when_full,
+            buffer.queue,
+            queue_path,
+            max_segment_bytes,
+        )?;
+        sink_channels.insert(name.clone(), tx);
         sink_receivers.insert(name.clone(), rx);
     }
 
-    // Build downstream adjacency
+    // Channels per edge
+    let mut edge_senders: HashMap<(String, String), EdgeSender> = HashMap::new();
+    let mut input_receivers: HashMap<String, Vec<mpsc::Receiver<EventEnvelope>>> = HashMap::new();
     let mut downstreams: HashMap<String, Vec<Downstream>> = HashMap::new();
-    if let Some(transforms) = &config.transforms {
-        for (name, cfg) in transforms {
-            for inp in &cfg.inputs {
-                let entry = downstreams.entry(inp.clone()).or_default();
-                if let Some(tx) = transform_channels.get(name) {
-                    entry.push(Downstream {
-                        name: name.clone(),
-                        tx: tx.clone(),
-                        mode: WhenFull::Block,
-                    });
+
+    for e in &graph.edges {
+        let to_kind = graph
+            .nodes
+            .get(&e.to)
+            .copied()
+            .unwrap_or(NodeKind::Transform);
+        match to_kind {
+            NodeKind::Sink => {
+                if let Some(sender) = sink_channels.get(&e.to) {
+                    edge_senders.insert(
+                        (e.from.clone(), e.to.clone()),
+                        EdgeSender::Sink(sender.clone()),
+                    );
+                } else {
+                    warn!("missing sink sender for {}", e.to);
                 }
             }
-        }
-    }
-    for (sink_name, sink_cfg) in &config.sinks {
-        for inp in &sink_cfg.inputs {
-            let entry = downstreams.entry(inp.clone()).or_default();
-            if let Some((tx, mode)) = sink_channels.get(sink_name) {
-                entry.push(Downstream {
-                    name: sink_name.clone(),
-                    tx: tx.clone(),
-                    mode: *mode,
-                });
+            _ => {
+                let (tx, rx) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
+                edge_senders.insert(
+                    (e.from.clone(), e.to.clone()),
+                    EdgeSender::Channel(tx.clone()),
+                );
+                input_receivers.entry(e.to.clone()).or_default().push(rx);
             }
         }
     }
 
-    // Route transform explicit outputs
-    if let Some(transforms) = &config.transforms {
-        for (name, cfg) in transforms {
-            if cfg.kind == "route" {
-                if let Some(routes) = &cfg.routes {
-                    for (_rname, rcfg) in routes {
-                        for out in &rcfg.outputs {
-                            let entry = downstreams.entry(name.clone()).or_default();
-                            if let Some(tx) = transform_channels.get(out) {
-                                entry.push(Downstream {
-                                    name: out.clone(),
-                                    tx: tx.clone(),
-                                    mode: WhenFull::Block,
-                                });
-                            } else if let Some((tx, mode)) = sink_channels.get(out) {
-                                entry.push(Downstream {
-                                    name: out.clone(),
-                                    tx: tx.clone(),
-                                    mode: *mode,
-                                });
-                            } else {
-                                warn!("route transform '{}' targets unknown output '{}'", name, out);
-                            }
-                        }
-                    }
-                }
-            }
+    for e in &graph.edges {
+        if let Some(sender) = edge_senders.get(&(e.from.clone(), e.to.clone())) {
+            downstreams
+                .entry(e.from.clone())
+                .or_default()
+                .push(Downstream {
+                    name: e.to.clone(),
+                    sender: sender.clone(),
+                });
         }
     }
 
@@ -441,22 +573,27 @@ pub async fn run_pipeline(
     if let Some(transforms) = &config.transforms {
         for (name, cfg) in transforms {
             let t = build_transform(name, cfg)?;
-            if let Some(rx) = transform_receivers.remove(name) {
+            if let Some(mut inputs) = input_receivers.remove(name) {
                 let downs = downstreams.get(name).cloned().unwrap_or_default();
-                
-                // Create intermediate channel for Transform output -> FanOut
-                let (tx_out, mut rx_out) = mpsc::channel::<Event>(DEFAULT_CHANNEL_SIZE);
-                
+                let merged_rx = if inputs.len() == 1 {
+                    inputs.remove(0)
+                } else {
+                    merge_inputs(inputs)
+                };
+
+                let (tx_out, mut rx_out) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
+
                 transform_tasks.push(task::spawn(async move {
-                    t.run(rx, tx_out).await;
+                    t.run(merged_rx, tx_out).await;
                 }));
 
-                // FanOut task
                 transform_tasks.push(task::spawn(async move {
                     while let Some(event) = rx_out.recv().await {
-                         fan_out(event, &downs).await;
+                        fan_out(event, &downs).await;
                     }
                 }));
+            } else {
+                warn!("transform '{}' has no inputs connected", name);
             }
         }
     }
@@ -466,7 +603,7 @@ pub async fn run_pipeline(
     for (name, scfg) in &config.sources {
         let src = build_source(name, scfg)?;
         let downs = downstreams.get(name).cloned().unwrap_or_default();
-        let (tx, mut rx) = mpsc::channel::<Event>(DEFAULT_CHANNEL_SIZE);
+        let (tx, mut rx) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
         
         let shutdown_rx = shutdown_tx.subscribe();
         source_tasks.push(task::spawn(async move {
@@ -480,10 +617,6 @@ pub async fn run_pipeline(
     }
 
     // Drop channels to ensure they are closed when all tasks finish
-    drop(transform_channels);
-    drop(sink_channels);
-    drop(downstreams);
-
     for t in source_tasks {
         let _ = t.await;
     }

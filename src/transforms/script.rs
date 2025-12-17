@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use crate::event::{Event, Value};
+use crate::event::{Event, EventEnvelope, Value};
 use crate::transforms::Transform;
 
 #[derive(Debug, Clone)]
@@ -514,19 +514,30 @@ impl ScriptTransform {
 
 #[async_trait]
 impl Transform for ScriptTransform {
-    async fn run(self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
+    async fn run(
+        self: Box<Self>,
+        mut input: mpsc::Receiver<EventEnvelope>,
+        output: mpsc::Sender<EventEnvelope>,
+    ) {
         while let Some(mut event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
             
-            if self.apply_ops(&self.ops, &mut event) {
-                 if output.send(event).await.is_err() { break; }
-                 metrics::increment_counter!("events_out", "component" => self.name.clone());
+            if self.apply_ops(&self.ops, &mut event.event) {
+                 match output.send(event).await {
+                    Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                    Err(err) => {
+                        let ev = err.0;
+                        ev.ack.ack();
+                        break;
+                    }
+                 }
             } else {
                  metrics::increment_counter!(
                     "events_dropped",
                     "component" => self.name.clone(),
                     "reason" => "script_drop"
                  );
+                 event.ack.ack();
             }
         }
     }
@@ -610,7 +621,7 @@ mod tests {
         "#;
         
         let t = ScriptTransform::compile("test".into(), script.to_string()).expect("compile");
-        let event = Event::new();
+        let event = EventEnvelope::new(Event::new());
         // .a = "1" is done in the script, so we start with empty or pre-populated?
         // Wait, the script says `.a = "1"` at the top.
         // So we don't need to populate .a manually.
@@ -623,7 +634,7 @@ mod tests {
         Box::new(t).run(rx_in, tx_out).await;
         
         let event = rx_out.recv().await.expect("should output");
-        let log = event.as_log().unwrap();
+        let log = event.event.as_log().unwrap();
         
         assert_eq!(log.fields.get("b"), Some(&Value::String("matched".to_string())));
         // .c should be "correct" because .a ("1") == "1", so != "1" is FALSE.

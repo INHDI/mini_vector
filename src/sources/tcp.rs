@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn, error};
 use metrics;
 
-use crate::event::Event;
+use crate::event::{Event, EventEnvelope};
 use crate::sources::Source;
 
 pub struct TcpSource {
@@ -19,7 +19,12 @@ impl TcpSource {
         Self { name, address, max_length }
     }
 
-    async fn handle_conn(&self, stream: TcpStream, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
+    async fn handle_conn(
+        &self,
+        stream: TcpStream,
+        tx: mpsc::Sender<EventEnvelope>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
         let peer = stream.peer_addr().ok().map(|p| p.to_string()).unwrap_or_else(|| "unknown".into());
         let (read_half, _) = tokio::io::split(stream);
         let reader = tokio::io::BufReader::new(read_half);
@@ -34,7 +39,9 @@ impl TcpSource {
                             let mut event = Event::new();
                             event.insert("message", msg);
                             event.insert("source", peer.clone());
-                            if tx.send(event).await.is_err() {
+                            let envelope = EventEnvelope::with_source(event, self.name.clone());
+                            if let Err(err) = tx.send(envelope).await {
+                                err.0.ack.ack();
                                 break;
                             }
                             metrics::increment_counter!("events_out", "component" => self.name.clone());
@@ -55,7 +62,11 @@ impl TcpSource {
 
 #[async_trait]
 impl Source for TcpSource {
-    async fn run(self: Box<Self>, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
+    async fn run(
+        self: Box<Self>,
+        tx: mpsc::Sender<EventEnvelope>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
         let listener = match TcpListener::bind(&self.address).await {
             Ok(l) => l,
             Err(err) => {

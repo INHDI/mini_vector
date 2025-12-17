@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
@@ -18,6 +18,16 @@ pub struct SourceConfig {
     // File source config:
     #[serde(default)]
     pub include: Vec<String>,
+    #[serde(default)]
+    pub read_from: Option<ReadFrom>,
+    #[serde(default)]
+    pub state_path: Option<String>,
+    #[serde(default)]
+    pub state_flush_secs: Option<u64>,
+    #[serde(default)]
+    pub scan_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub fingerprint_bytes: Option<usize>,
 
     // syslog / tcp sources
     #[serde(default)]
@@ -227,6 +237,8 @@ pub struct SinkBufferConfig {
     #[allow(dead_code)]
     #[serde(default)]
     pub queue: QueueType,
+    #[serde(default)]
+    pub queue_path: Option<String>,
 }
 
 impl Default for SinkBufferConfig {
@@ -237,6 +249,7 @@ impl Default for SinkBufferConfig {
             max_bytes: default_buffer_max_bytes(),
             timeout_secs: default_buffer_timeout_secs(),
             queue: QueueType::InMemory,
+            queue_path: None,
         }
     }
 }
@@ -258,6 +271,8 @@ fn default_buffer_timeout_secs() -> u64 {
 pub enum WhenFull {
     Block,
     DropNew,
+    DropOldest,
+    SpillToDisk,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -265,6 +280,13 @@ pub enum WhenFull {
 pub enum QueueType {
     InMemory,
     Disk,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFrom {
+    Beginning,
+    End,
 }
 
 impl Default for QueueType {
@@ -306,6 +328,16 @@ impl FullConfig {
                 "file" => {
                     if s.include.is_empty() {
                         anyhow::bail!("source '{}' (file) missing 'include'", name);
+                    }
+                    if let Some(flush) = s.state_flush_secs {
+                        if flush == 0 {
+                            anyhow::bail!("source '{}' (file) state_flush_secs must be > 0", name);
+                        }
+                    }
+                    if let Some(scan) = s.scan_interval_secs {
+                        if scan == 0 {
+                            anyhow::bail!("source '{}' (file) scan_interval_secs must be > 0", name);
+                        }
                     }
                 }
                 "syslog" => {

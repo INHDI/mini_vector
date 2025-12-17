@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn, error};
 use metrics;
 
-use crate::event::Event;
+use crate::event::{Event, EventEnvelope};
 use crate::sources::Source;
 
 pub struct SyslogSource {
@@ -20,7 +20,7 @@ impl SyslogSource {
         Self { name, mode, address, max_length }
     }
 
-    async fn run_udp(&self, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
+    async fn run_udp(&self, tx: mpsc::Sender<EventEnvelope>, mut shutdown: broadcast::Receiver<()>) {
         let socket = match UdpSocket::bind(&self.address).await {
             Ok(s) => s,
             Err(err) => {
@@ -39,7 +39,9 @@ impl SyslogSource {
                             let mut event = Event::new();
                             event.insert("message", msg);
                             event.insert("source", peer.to_string());
-                            if tx.send(event).await.is_err() {
+                            let envelope = EventEnvelope::with_source(event, self.name.clone());
+                            if let Err(err) = tx.send(envelope).await {
+                                err.0.ack.ack();
                                 break;
                             }
                             metrics::increment_counter!("events_out", "component" => self.name.clone());
@@ -58,7 +60,12 @@ impl SyslogSource {
         }
     }
 
-    async fn handle_tcp_conn(&self, stream: TcpStream, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
+    async fn handle_tcp_conn(
+        &self,
+        stream: TcpStream,
+        tx: mpsc::Sender<EventEnvelope>,
+        mut shutdown: broadcast::Receiver<()>,
+    ) {
         let peer = stream.peer_addr().ok().map(|p| p.to_string()).unwrap_or_else(|| "unknown".into());
         let (read_half, _) = tokio::io::split(stream);
         let reader = tokio::io::BufReader::new(read_half);
@@ -73,7 +80,9 @@ impl SyslogSource {
                             let mut event = Event::new();
                             event.insert("message", msg);
                             event.insert("source", peer.clone());
-                            if tx.send(event).await.is_err() {
+                            let envelope = EventEnvelope::with_source(event, self.name.clone());
+                            if let Err(err) = tx.send(envelope).await {
+                                err.0.ack.ack();
                                 break;
                             }
                             metrics::increment_counter!("events_out", "component" => self.name.clone());
@@ -91,7 +100,7 @@ impl SyslogSource {
         }
     }
 
-    async fn run_tcp(&self, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
+    async fn run_tcp(&self, tx: mpsc::Sender<EventEnvelope>, mut shutdown: broadcast::Receiver<()>) {
         let listener = match TcpListener::bind(&self.address).await {
             Ok(l) => l,
             Err(err) => {
@@ -139,7 +148,7 @@ impl Clone for SyslogSource {
 
 #[async_trait]
 impl Source for SyslogSource {
-    async fn run(self: Box<Self>, tx: mpsc::Sender<Event>, shutdown: broadcast::Receiver<()>) {
+    async fn run(self: Box<Self>, tx: mpsc::Sender<EventEnvelope>, shutdown: broadcast::Receiver<()>) {
         match self.mode.as_str() {
             "udp" => self.run_udp(tx, shutdown).await,
             "tcp" => self.run_tcp(tx, shutdown).await,

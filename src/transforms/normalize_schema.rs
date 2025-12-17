@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use chrono::Utc;
 
-use crate::event::{parse_timestamp, Event, Value};
+use crate::event::{parse_timestamp, Event, EventEnvelope, Value};
 use crate::transforms::Transform;
 
 /// NormalizeSchemaTransform: map field nguồn về schema Mini SOC
@@ -219,12 +219,22 @@ fn normalize_severity(value: Option<&Value>) -> Value {
 
 #[async_trait]
 impl Transform for NormalizeSchemaTransform {
-    async fn run(self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
+    async fn run(
+        self: Box<Self>,
+        mut input: mpsc::Receiver<EventEnvelope>,
+        output: mpsc::Sender<EventEnvelope>,
+    ) {
         while let Some(mut event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
-            self.apply_logic(&mut event);
-            if output.send(event).await.is_err() { break; }
-            metrics::increment_counter!("events_out", "component" => self.name.clone());
+            self.apply_logic(&mut event.event);
+            match output.send(event).await {
+                Ok(_) => metrics::increment_counter!("events_out", "component" => self.name.clone()),
+                Err(err) => {
+                    let ev = err.0;
+                    ev.ack.ack();
+                    break;
+                }
+            }
         }
     }
 }
@@ -236,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn sets_defaults_when_missing() {
-        let event = Event::new();
+        let event = EventEnvelope::new(Event::new());
         let t0 = Utc::now();
         let t = NormalizeSchemaTransform::new("test".into(), None, None, None, None, None, None, None);
         
@@ -248,7 +258,7 @@ mod tests {
         Box::new(t).run(rx_in, tx_out).await;
 
         let event = rx_out.recv().await.expect("should output event");
-        let log = event.as_log().unwrap();
+        let log = event.event.as_log().unwrap();
 
         match log.fields.get("@timestamp") {
             Some(Value::Timestamp(ts)) => {
@@ -274,6 +284,7 @@ mod tests {
     async fn parses_timestamp_from_string_field_and_uses_default_log_type() {
         let mut event = Event::new();
         event.insert("ts_raw", "2024-01-02T03:04:05Z");
+        let envelope = EventEnvelope::new(event);
         let t = NormalizeSchemaTransform::new(
             "test".into(),
             Some("ts_raw".to_string()),
@@ -287,13 +298,13 @@ mod tests {
         
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
-        tx_in.send(event).await.unwrap();
+        tx_in.send(envelope).await.unwrap();
         drop(tx_in);
 
         Box::new(t).run(rx_in, tx_out).await;
         
         let event = rx_out.recv().await.expect("should output event");
-        let log = event.as_log().unwrap();
+        let log = event.event.as_log().unwrap();
 
         match log.fields.get("@timestamp") {
             Some(Value::Timestamp(ts)) => {
@@ -312,6 +323,7 @@ mod tests {
         let mut event = Event::new();
         event.insert("sev", "warning");
         event.insert("sev_num", 2_i64);
+        let envelope = EventEnvelope::new(event);
         
         let t = NormalizeSchemaTransform::new("test".into(), None, None, Some("sev".to_string()), None, None, None, None);
         
@@ -322,13 +334,13 @@ mod tests {
         // Run 1
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
-        tx_in.send(event).await.unwrap();
+        tx_in.send(envelope).await.unwrap();
         drop(tx_in);
         Box::new(t).run(rx_in, tx_out).await;
         let event = rx_out.recv().await.unwrap();
         
         assert_eq!(
-            event.as_log().unwrap().fields.get("severity"),
+            event.event.as_log().unwrap().fields.get("severity"),
             Some(&Value::String("WARN".to_string()))
         );
 
@@ -351,7 +363,7 @@ mod tests {
         let event = rx_out.recv().await.unwrap();
         
         assert_eq!(
-            event.as_log().unwrap().fields.get("severity"),
+            event.event.as_log().unwrap().fields.get("severity"),
             Some(&Value::String("ERROR".to_string()))
         );
     }
@@ -366,6 +378,7 @@ mod tests {
         event.insert("status", "200");
         event.insert("rule_id", "R1");
         event.insert("signature", "TestRule");
+        let envelope = EventEnvelope::new(event);
 
         let t = NormalizeSchemaTransform::new(
             "test".into(),
@@ -380,11 +393,11 @@ mod tests {
 
         let (tx_in, rx_in) = mpsc::channel(1);
         let (tx_out, mut rx_out) = mpsc::channel(1);
-        tx_in.send(event).await.unwrap();
+        tx_in.send(envelope).await.unwrap();
         drop(tx_in);
         Box::new(t).run(rx_in, tx_out).await;
         let event = rx_out.recv().await.unwrap();
-        let log = event.as_log().unwrap();
+        let log = event.event.as_log().unwrap();
 
         assert_eq!(log.fields.get("src_ip"), Some(&Value::String("1.1.1.1".into())));
         assert_eq!(log.fields.get("dest_port"), Some(&Value::Integer(443)));

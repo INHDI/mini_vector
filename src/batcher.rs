@@ -1,16 +1,16 @@
 use std::time::{Duration, Instant};
 
 use crate::config::BatchConfig;
-use crate::event::Event;
+use crate::event::EventEnvelope;
 use serde_json;
 
 pub struct Batch {
-    pub events: Vec<Event>,
+    pub events: Vec<EventEnvelope>,
     pub bytes: usize,
 }
 
 pub struct Batcher {
-    pub items: Vec<Event>,
+    pub items: Vec<EventEnvelope>,
     pub max_events: usize,
     pub max_bytes: usize,
     pub timeout: Duration,
@@ -42,7 +42,7 @@ impl Batcher {
         }
     }
 
-    pub fn add(&mut self, event: Event) {
+    pub fn add(&mut self, event: EventEnvelope) {
         let bytes = estimate_event_size(&event);
         self.current_bytes = self.current_bytes.saturating_add(bytes);
         self.items.push(event);
@@ -97,19 +97,19 @@ impl Batcher {
     }
 }
 
-fn estimate_event_size(event: &Event) -> usize {
+fn estimate_event_size(event: &EventEnvelope) -> usize {
     serde_json::to_vec(event).map(|v| v.len()).unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
+    use crate::event::EventEnvelope;
 
-    fn simple_event() -> Event {
+    fn simple_event() -> EventEnvelope {
         let mut ev = Event::new();
         ev.insert("message", "hello");
-        ev
+        EventEnvelope::new(ev)
     }
 
     #[test]
@@ -142,4 +142,3 @@ mod tests {
         assert!(batch.bytes > 0);
     }
 }
-

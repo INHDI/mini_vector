@@ -1,9 +1,8 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use tracing::{info, error};
 use metrics;
 
-use crate::event::Event;
+use crate::queue::SinkReceiver;
 use crate::sinks::Sink;
 
 pub struct ConsoleSink {
@@ -18,12 +17,12 @@ impl ConsoleSink {
 
 #[async_trait]
 impl Sink for ConsoleSink {
-    async fn run(self: Box<Self>, mut rx: mpsc::Receiver<Event>) {
+    async fn run(self: Box<Self>, rx: SinkReceiver) {
         info!("ConsoleSink[{}] started", self.name);
-        while let Some(event) = rx.recv().await {
+        while let Some(envelope) = rx.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
 
-            match serde_json::to_string(&event) {
+            match serde_json::to_string(&envelope.event) {
                 Ok(serialized) => {
                     println!("[sink:{}] {}", self.name, serialized);
                     metrics::increment_counter!("events_out", "component" => self.name.clone());
@@ -37,6 +36,7 @@ impl Sink for ConsoleSink {
                     );
                 }
             }
+            envelope.ack.ack();
         }
         info!("ConsoleSink[{}] exiting", self.name);
     }

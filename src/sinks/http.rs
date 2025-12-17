@@ -1,11 +1,10 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 use metrics;
 
 use crate::batcher::{Batch, Batcher};
 use crate::config::BatchConfig;
-use crate::event::Event;
+use crate::queue::SinkReceiver;
 use crate::sinks::Sink;
 
 pub struct HttpSink {
@@ -31,7 +30,14 @@ impl HttpSink {
             return;
         }
 
-        let body = serde_json::to_value(&batch.events).unwrap_or_else(|_| serde_json::json!([]));
+        let body = serde_json::to_value(
+            &batch
+                .events
+                .iter()
+                .map(|ev| &ev.event)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| serde_json::json!([]));
 
         let res = self.client.post(&self.endpoint).json(&body).send().await;
 
@@ -86,12 +92,16 @@ impl HttpSink {
                 metrics::increment_counter!("batches_failed", "component" => self.name.clone());
             }
         }
+
+        for ev in batch.events {
+            ev.ack.ack();
+        }
     }
 }
 
 #[async_trait]
 impl Sink for HttpSink {
-    async fn run(self: Box<Self>, mut rx: mpsc::Receiver<Event>) {
+    async fn run(self: Box<Self>, rx: SinkReceiver) {
         info!("HttpSink[{}] started, endpoint={}", self.name, self.endpoint);
 
         let mut batcher = Batcher::new(self.batch_config.clone());

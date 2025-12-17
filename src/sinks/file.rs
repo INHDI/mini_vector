@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 use metrics;
 use chrono::Utc;
 
-use crate::event::Event;
+use crate::event::EventEnvelope;
+use crate::queue::SinkReceiver;
 use crate::sinks::Sink;
 
 pub struct FileSink {
@@ -46,8 +46,8 @@ impl FileSink {
         Ok(())
     }
 
-    async fn write_event(&mut self, event: &Event) -> anyhow::Result<()> {
-        let line = serde_json::to_string(event)?;
+    async fn write_event(&mut self, event: &EventEnvelope) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&event.event)?;
         let bytes = line.as_bytes();
         if self.current_bytes + bytes.len() as u64 + 1 > self.max_bytes {
             self.rotate().await?;
@@ -61,7 +61,7 @@ impl FileSink {
 
 #[async_trait]
 impl Sink for FileSink {
-    async fn run(mut self: Box<Self>, mut rx: mpsc::Receiver<Event>) {
+    async fn run(mut self: Box<Self>, rx: SinkReceiver) {
         info!("FileSink[{}] writing to {}", self.name, self.path);
         while let Some(event) = rx.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
@@ -78,6 +78,7 @@ impl Sink for FileSink {
                     );
                 }
             }
+            event.ack.ack();
         }
         if let Err(err) = self.writer.flush().await {
             warn!("FileSink[{}] flush error: {}", self.name, err);

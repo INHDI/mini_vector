@@ -6,7 +6,7 @@ use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
 use std::collections::BTreeMap;
 
-use crate::event::{Event, Value, LogEvent};
+use crate::event::{Event, EventEnvelope, Value, LogEvent};
 use crate::transforms::Transform;
 
 pub struct RouteRule {
@@ -69,26 +69,36 @@ impl RouteTransform {
 
 #[async_trait]
 impl Transform for RouteTransform {
-    async fn run(mut self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
+    async fn run(
+        mut self: Box<Self>,
+        mut input: mpsc::Receiver<EventEnvelope>,
+        output: mpsc::Sender<EventEnvelope>,
+    ) {
         while let Some(event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
             let mut any_matched = false;
 
             for idx in 0..self.routes.len() {
-                match self.eval_rule(idx, &event) {
+                match self.eval_rule(idx, &event.event) {
                     Ok(true) => {
                         any_matched = true;
                         let rule = &self.routes[idx];
                         for target in &rule.outputs {
                             let mut ev_clone = event.clone();
-                            let Event::Log(LogEvent { fields }) = &mut ev_clone;
+                            let Event::Log(LogEvent { fields }) = &mut ev_clone.event;
                             fields.insert("__route_target".to_string(), Value::String(target.clone()));
-                            if output.send(ev_clone).await.is_ok() {
-                                metrics::increment_counter!(
-                                    "events_out",
-                                    "component" => self.name.clone(),
-                                    "route" => rule.name.clone()
-                                );
+                            match output.send(ev_clone).await {
+                                Ok(_) => {
+                                    metrics::increment_counter!(
+                                        "events_out",
+                                        "component" => self.name.clone(),
+                                        "route" => rule.name.clone()
+                                    );
+                                }
+                                Err(err) => {
+                                    let ev = err.0;
+                                    ev.ack.ack();
+                                }
                             }
                         }
                     }
@@ -108,14 +118,20 @@ impl Transform for RouteTransform {
                 if !self.default_outputs.is_empty() {
                     for target in &self.default_outputs {
                         let mut ev_clone = event.clone();
-                        let Event::Log(LogEvent { fields }) = &mut ev_clone;
+                        let Event::Log(LogEvent { fields }) = &mut ev_clone.event;
                         fields.insert("__route_target".to_string(), Value::String(target.clone()));
-                        if output.send(ev_clone).await.is_ok() {
-                            metrics::increment_counter!(
-                                "events_out",
-                                "component" => self.name.clone(),
-                                "route" => "default"
-                            );
+                        match output.send(ev_clone).await {
+                            Ok(_) => {
+                                metrics::increment_counter!(
+                                    "events_out",
+                                    "component" => self.name.clone(),
+                                    "route" => "default"
+                                );
+                            }
+                            Err(err) => {
+                                let ev = err.0;
+                                ev.ack.ack();
+                            }
                         }
                     }
                 } else {
@@ -126,6 +142,7 @@ impl Transform for RouteTransform {
                     );
                 }
             }
+            event.ack.ack();
         }
     }
 }
@@ -168,10 +185,10 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
-    fn event_with_type(ty: &str) -> Event {
+    fn event_with_type(ty: &str) -> EventEnvelope {
         let mut ev = Event::new();
         ev.insert("log_type", ty.to_string());
-        ev
+        EventEnvelope::new(ev)
     }
 
     #[tokio::test]
@@ -191,13 +208,13 @@ mod tests {
 
         let mut targets = Vec::new();
         let first = timeout(Duration::from_millis(200), rx_out.recv()).await.unwrap().unwrap();
-        let Event::Log(log) = &first;
+        let Event::Log(log) = &first.event;
         if let Some(Value::String(t)) = log.fields.get("__route_target") {
             targets.push(t.clone());
         }
 
         let second = timeout(Duration::from_millis(200), rx_out.recv()).await.unwrap().unwrap();
-        let Event::Log(log2) = &second;
+        let Event::Log(log2) = &second.event;
         if let Some(Value::String(t)) = log2.fields.get("__route_target") {
             targets.push(t.clone());
         }

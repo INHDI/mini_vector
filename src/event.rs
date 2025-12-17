@@ -1,4 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::fmt;
+
+use tokio::sync::Notify;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -67,6 +72,141 @@ pub struct LogEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Event {
     Log(LogEvent),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventMetadata {
+    pub source: Option<String>,
+    pub attempt: u32,
+    pub received_at: Option<DateTime<Utc>>,
+}
+
+/// Event + metadata + ack handle that travels through the pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub event: Event,
+    #[serde(default)]
+    pub metadata: EventMetadata,
+    #[serde(skip)]
+    pub ack: AckToken,
+}
+
+impl EventEnvelope {
+    pub fn new(event: Event) -> Self {
+        Self {
+            event,
+            metadata: EventMetadata {
+                attempt: 1,
+                ..Default::default()
+            },
+            ack: AckToken::new(),
+        }
+    }
+
+    pub fn with_source(event: Event, source: impl Into<String>) -> Self {
+        Self {
+            metadata: EventMetadata {
+                source: Some(source.into()),
+                attempt: 1,
+                received_at: Some(Utc::now()),
+            },
+            ..Self::new(event)
+        }
+    }
+}
+
+pub struct AckToken {
+    state: Arc<AckState>,
+}
+
+struct AckState {
+    remaining: AtomicUsize,
+    completed: AtomicBool,
+    callbacks: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+    notify: Notify,
+}
+
+impl AckState {
+    fn new() -> Self {
+        Self {
+            remaining: AtomicUsize::new(1),
+            completed: AtomicBool::new(false),
+            callbacks: Mutex::new(Vec::new()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn complete(&self) {
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let callbacks = std::mem::take(&mut *self.callbacks.lock().unwrap());
+            for cb in callbacks {
+                cb();
+            }
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+impl AckToken {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AckState::new()),
+        }
+    }
+
+    /// Attach a callback that will be invoked exactly once when all clones are acked.
+    pub fn on_complete<F>(&self, f: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        // If already completed, run immediately.
+        if self.state.completed.load(Ordering::SeqCst) {
+            f();
+            return;
+        }
+        self.state.callbacks.lock().unwrap().push(Box::new(f));
+    }
+
+    /// Mark this token as acknowledged. The final ack (after all clones) will
+    /// trigger callbacks and wake any waiters.
+    pub fn ack(&self) {
+        if self.state.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.state.complete();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn wait(&self) {
+        if self.state.completed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.state.notify.notified().await;
+    }
+}
+
+impl Default for AckToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for AckToken {
+    fn clone(&self) -> Self {
+        self.state.remaining.fetch_add(1, Ordering::SeqCst);
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for AckToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AckToken")
+    }
 }
 
 impl Event {

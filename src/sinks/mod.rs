@@ -1,7 +1,6 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 
-use crate::event::Event;
+use crate::queue::SinkReceiver;
 
 pub mod console;
 pub mod file;
@@ -10,5 +9,5 @@ pub mod opensearch;
 
 #[async_trait]
 pub trait Sink: Send + Sync {
-    async fn run(self: Box<Self>, rx: mpsc::Receiver<Event>);
+    async fn run(self: Box<Self>, rx: SinkReceiver);
 }

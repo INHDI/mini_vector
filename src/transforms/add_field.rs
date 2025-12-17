@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use crate::event::{Event, Value};
+use crate::event::{EventEnvelope, Value};
 use crate::transforms::Transform;
 
 pub struct AddFieldTransform {
@@ -17,16 +17,26 @@ impl AddFieldTransform {
 
 #[async_trait]
 impl Transform for AddFieldTransform {
-    async fn run(self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
+    async fn run(
+        self: Box<Self>,
+        mut input: mpsc::Receiver<EventEnvelope>,
+        output: mpsc::Sender<EventEnvelope>,
+    ) {
         while let Some(mut event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
             
-            event.insert(self.field.clone(), self.value.clone());
+            event.event.insert(self.field.clone(), self.value.clone());
             
-            if output.send(event).await.is_err() {
-                break;
+            match output.send(event).await {
+                Ok(_) => {
+                    metrics::increment_counter!("events_out", "component" => self.name.clone());
+                }
+                Err(err) => {
+                    let ev = err.0;
+                    ev.ack.ack();
+                    break;
+                }
             }
-            metrics::increment_counter!("events_out", "component" => self.name.clone());
         }
     }
 }

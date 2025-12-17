@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use crate::event::Event;
+use crate::event::EventEnvelope;
 use crate::transforms::Transform;
 
 pub struct ContainsFilterTransform {
@@ -17,27 +17,38 @@ impl ContainsFilterTransform {
 
 #[async_trait]
 impl Transform for ContainsFilterTransform {
-    async fn run(self: Box<Self>, mut input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>) {
+    async fn run(
+        self: Box<Self>,
+        mut input: mpsc::Receiver<EventEnvelope>,
+        output: mpsc::Sender<EventEnvelope>,
+    ) {
         while let Some(event) = input.recv().await {
             metrics::increment_counter!("events_in", "component" => self.name.clone());
             
-            let keep = if let Some(v) = event.get_str(&self.field) {
+            let keep = if let Some(v) = event.event.get_str(&self.field) {
                 v.contains(&self.needle)
             } else {
                 false
             };
 
             if keep {
-                if output.send(event).await.is_err() {
-                    break;
+                match output.send(event).await {
+                    Ok(_) => {
+                        metrics::increment_counter!("events_out", "component" => self.name.clone());
+                    }
+                    Err(err) => {
+                        let ev = err.0;
+                        ev.ack.ack();
+                        break;
+                    }
                 }
-                metrics::increment_counter!("events_out", "component" => self.name.clone());
             } else {
                 metrics::increment_counter!(
                     "events_dropped",
                     "component" => self.name.clone(),
                     "reason" => "filtered_out"
                 );
+                event.ack.ack();
             }
         }
     }

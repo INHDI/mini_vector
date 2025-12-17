@@ -2,15 +2,17 @@ use async_trait::async_trait;
 use base64::Engine;
 use chrono::Utc;
 use reqwest::Client;
-use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tokio::time::Duration;
+use tracing::{info, warn};
 use metrics;
+use std::collections::HashSet;
 
 use crate::batcher::{Batch, Batcher};
 use crate::config::{
     BatchConfig, OpenSearchAuthConfig, OpenSearchBulkConfig, OpenSearchRetryConfig, OpenSearchTlsConfig,
 };
-use crate::event::{Event, Value};
+use crate::event::{Event, EventEnvelope, Value};
+use crate::queue::SinkReceiver;
 use crate::sinks::Sink;
 use crate::health::HealthState;
 
@@ -26,6 +28,14 @@ pub struct OpenSearchSink {
     pub retry: OpenSearchRetryConfig,
     pub client: Client,
     pub health: Option<HealthState>,
+}
+
+struct BulkAttemptResult {
+    success: Vec<usize>,
+    retryable: Vec<usize>,
+    fatal: Vec<usize>,
+    had_errors: bool,
+    status: Option<reqwest::StatusCode>,
 }
 
 impl OpenSearchSink {
@@ -118,21 +128,32 @@ impl OpenSearchSink {
         }
     }
 
-    async fn send_bulk(&self, batch: Batch) {
-        let batch_len = batch.events.len();
-        if batch_len == 0 {
-            return;
-        }
+    fn build_bulk_body(&self, events: &[EventEnvelope]) -> String {
         let index = self.resolve_index();
         let mut body = String::new();
-        for ev in batch.events {
+        for ev in events {
             let header = serde_json::json!({ "index": { "_index": index } });
-            let doc = Self::event_to_doc(ev);
+            let doc = Self::event_to_doc(ev.event.clone());
             body.push_str(&serde_json::to_string(&header).unwrap_or_else(|_| "{}".into()));
             body.push('\n');
             body.push_str(&serde_json::to_string(&doc).unwrap_or_else(|_| "{}".into()));
             body.push('\n');
         }
+        body
+    }
+
+    async fn send_bulk_once(
+        &self,
+        events: &[EventEnvelope],
+        body: &str,
+    ) -> BulkAttemptResult {
+        let mut result = BulkAttemptResult {
+            success: Vec::new(),
+            retryable: Vec::new(),
+            fatal: Vec::new(),
+            had_errors: false,
+            status: None,
+        };
 
         let endpoint = format!("{}/_bulk", self.endpoints[0].trim_end_matches('/'));
         let mut base_req = self
@@ -148,137 +169,178 @@ impl OpenSearchSink {
             }
         }
 
+        let req = match base_req.try_clone() {
+            Some(r) => r.body(body.to_string()),
+            None => {
+                result.fatal = (0..events.len()).collect();
+                return result;
+            }
+        };
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                result.status = Some(status);
+                let text = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    if status.is_server_error() {
+                        result.retryable = (0..events.len()).collect();
+                    } else {
+                        result.fatal = (0..events.len()).collect();
+                    }
+                    return result;
+                }
+
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}));
+                let has_errors = parsed
+                    .get("errors")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                result.had_errors = has_errors;
+
+                let items = parsed
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                for (idx, item) in items.iter().enumerate() {
+                    let status = item
+                        .get("index")
+                        .and_then(|i| i.get("status"))
+                        .and_then(|s| s.as_u64())
+                        .unwrap_or(500);
+                    if (200..300).contains(&status) {
+                        result.success.push(idx);
+                    } else if status == 429 || status >= 500 {
+                        result.retryable.push(idx);
+                    } else {
+                        result.fatal.push(idx);
+                    }
+                }
+
+                if items.len() < events.len() {
+                    result.retryable
+                        .extend(items.len()..events.len());
+                }
+            }
+            Err(err) => {
+                let recoverable = err.is_timeout() || err.is_connect();
+                if recoverable {
+                    result.retryable = (0..events.len()).collect();
+                } else {
+                    result.fatal = (0..events.len()).collect();
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn send_bulk_with_retry(&self, batch: Batch) {
+        let mut pending = batch.events;
+        if pending.is_empty() {
+            return;
+        }
         let mut attempt = 0;
         let mut backoff = self.retry.backoff_secs;
-        loop {
+        let mut last_result: Option<BulkAttemptResult> = None;
+
+        while !pending.is_empty() {
             attempt += 1;
-            let req = match base_req.try_clone() {
-                Some(r) => r.body(body.clone()),
-                None => {
-                    error!(
-                        "OpenSearchSink[{}] failed to clone request attempt={}/{}: {}",
-                        self.name,
-                        attempt,
-                        self.retry.attempts,
-                        "no_clone"
+            let body = self.build_bulk_body(&pending);
+            let result = self.send_bulk_once(&pending, &body).await;
+            let success: HashSet<_> = result.success.iter().copied().collect();
+            let retryable: HashSet<_> = result.retryable.iter().copied().collect();
+            let fatal: HashSet<_> = result.fatal.iter().copied().collect();
+
+            if !retryable.is_empty() || !fatal.is_empty() || result.had_errors {
+                warn!(
+                    "OpenSearchSink[{}] bulk attempt={}/{} status={:?} success={} retryable={} fatal={}",
+                    self.name,
+                    attempt,
+                    self.retry.attempts,
+                    result.status,
+                    success.len(),
+                    retryable.len(),
+                    fatal.len()
+                );
+            }
+
+            let mut next_pending = Vec::new();
+            for (idx, ev) in pending.into_iter().enumerate() {
+                if success.contains(&idx) {
+                    metrics::increment_counter!("events_out", "component" => self.name.clone());
+                    ev.ack.ack();
+                } else if fatal.contains(&idx) {
+                    metrics::increment_counter!(
+                        "events_failed",
+                        "component" => self.name.clone(),
+                        "reason" => "mapping_error"
+                    );
+                    ev.ack.ack();
+                } else if retryable.contains(&idx) {
+                    next_pending.push(ev);
+                } else {
+                    // default to retry if classification missing
+                    next_pending.push(ev);
+                }
+            }
+
+            if next_pending.is_empty() {
+                if result.fatal.is_empty() && result.retryable.is_empty() {
+                    if let Some(h) = &self.health {
+                        h.mark_opensearch_ok();
+                    }
+                    metrics::increment_counter!("batches_sent", "component" => self.name.clone());
+                    metrics::counter!(
+                        "batch_size_event",
+                        success.len() as u64,
+                        "component" => self.name.clone()
                     );
                     metrics::counter!(
-                        "events_failed",
-                        batch_len as u64,
-                        "component" => self.name.clone(),
-                        "reason" => "request_clone"
+                        "batch_size_bytes",
+                        batch.bytes as u64,
+                        "component" => self.name.clone()
                     );
+                } else {
                     metrics::increment_counter!("batches_failed", "component" => self.name.clone());
-                    break;
                 }
-            };
-
-            let res = req.send().await;
-
-            let should_retry = match res {
-                Ok(r) => {
-                    let status = r.status();
-                    let status_ok = status.is_success();
-                    let txt = r.text().await.unwrap_or_else(|_| "".to_string());
-                    let has_errors = txt.contains(r#""errors":true"#);
-
-                    if status_ok && !has_errors {
-                        metrics::counter!(
-                            "events_out",
-                            batch_len as u64,
-                            "component" => self.name.clone()
-                        );
-                        if let Some(h) = &self.health {
-                            h.mark_opensearch_ok();
-                        }
-                        metrics::increment_counter!("batches_sent", "component" => self.name.clone());
-                        metrics::counter!(
-                            "batch_size_event",
-                            batch_len as u64,
-                            "component" => self.name.clone()
-                        );
-                        metrics::counter!(
-                            "batch_size_bytes",
-                            batch.bytes as u64,
-                            "component" => self.name.clone()
-                        );
-                        false
-                    } else if has_errors || status.is_client_error() {
-                        let reason = if has_errors { "mapping_error" } else { "client_error" };
-                        warn!(
-                            "OpenSearchSink[{}] bulk status={} errors_flag={} attempt={}/{}",
-                            self.name,
-                            status,
-                            has_errors,
-                            attempt,
-                            self.retry.attempts
-                        );
-                        metrics::counter!(
-                            "events_failed",
-                            batch_len as u64,
-                            "component" => self.name.clone(),
-                            "reason" => reason
-                        );
-                        metrics::increment_counter!("batches_failed", "component" => self.name.clone());
-                        false
-                    } else if status.is_server_error() && attempt < self.retry.attempts {
-                        true
-                    } else {
-                        warn!(
-                            "OpenSearchSink[{}] bulk status={} attempt={}/{} exhausted retries",
-                            self.name,
-                            status,
-                            attempt,
-                            self.retry.attempts
-                        );
-                        metrics::counter!(
-                            "events_failed",
-                            batch_len as u64,
-                            "component" => self.name.clone(),
-                            "reason" => "server_error"
-                        );
-                        metrics::increment_counter!("batches_failed", "component" => self.name.clone());
-                        false
-                    }
-                }
-                Err(err) => {
-                    let recoverable = err.is_timeout() || err.is_connect();
-                    warn!(
-                        "OpenSearchSink[{}] error sending bulk attempt={}/{}: {}",
-                        self.name,
-                        attempt,
-                        self.retry.attempts,
-                        err
-                    );
-                    if recoverable && attempt < self.retry.attempts {
-                        true
-                    } else {
-                        metrics::counter!(
-                            "events_failed",
-                            batch_len as u64,
-                            "component" => self.name.clone(),
-                            "reason" => if err.is_timeout() { "timeout" } else { "http_error" }
-                        );
-                        metrics::increment_counter!("batches_failed", "component" => self.name.clone());
-                        false
-                    }
-                }
-            };
-
-            if should_retry {
-                let sleep_dur = std::time::Duration::from_secs(backoff);
-                tokio::time::sleep(sleep_dur).await;
-                backoff = (backoff * 2).min(self.retry.max_backoff_secs);
-                continue;
+                last_result = Some(result);
+                break;
             }
-            break;
+
+            if attempt >= self.retry.attempts {
+                metrics::increment_counter!("batches_failed", "component" => self.name.clone());
+                for ev in next_pending {
+                    metrics::increment_counter!(
+                        "events_failed",
+                        "component" => self.name.clone(),
+                        "reason" => "retries_exhausted"
+                    );
+                    ev.ack.ack();
+                }
+                return;
+            }
+
+            pending = next_pending;
+            last_result = Some(result);
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(self.retry.max_backoff_secs);
+        }
+
+        if let Some(res) = last_result {
+            if res.had_errors || res.status.map(|s| s.is_client_error()).unwrap_or(false) {
+                metrics::increment_counter!("batches_failed", "component" => self.name.clone());
+            }
         }
     }
 }
 
 #[async_trait]
 impl Sink for OpenSearchSink {
-    async fn run(self: Box<Self>, mut rx: mpsc::Receiver<Event>) {
+    async fn run(self: Box<Self>, rx: SinkReceiver) {
         info!("OpenSearchSink[{}] started", self.name);
         let mut batcher = Batcher::new(self.batch_config.clone());
 
@@ -291,12 +353,12 @@ impl Sink for OpenSearchSink {
                             metrics::increment_counter!("events_in", "component" => self.name.clone());
                             batcher.add(event);
                             if batcher.should_flush() {
-                                self.send_bulk(batcher.take()).await;
+                                self.send_bulk_with_retry(batcher.take()).await;
                             }
                         }
                         None => {
                             if !batcher.items.is_empty() {
-                                self.send_bulk(batcher.take()).await;
+                                self.send_bulk_with_retry(batcher.take()).await;
                             }
                             break;
                         }
@@ -304,7 +366,7 @@ impl Sink for OpenSearchSink {
                 }
                 _ = tokio::time::sleep(timeout) => {
                     if batcher.should_flush() {
-                        self.send_bulk(batcher.take()).await;
+                        self.send_bulk_with_retry(batcher.take()).await;
                     }
                 }
             }
@@ -313,4 +375,3 @@ impl Sink for OpenSearchSink {
         info!("OpenSearchSink[{}] exiting", self.name);
     }
 }
-

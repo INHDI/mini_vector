@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::event::Event;
+use crate::event::EventEnvelope;
 
 pub mod add_field;
 pub mod contains_filter;
@@ -15,5 +15,9 @@ pub mod detect;
 
 #[async_trait]
 pub trait Transform: Send + Sync {
-    async fn run(self: Box<Self>, input: mpsc::Receiver<Event>, output: mpsc::Sender<Event>);
+    async fn run(
+        self: Box<Self>,
+        input: mpsc::Receiver<EventEnvelope>,
+        output: mpsc::Sender<EventEnvelope>,
+    );
 }

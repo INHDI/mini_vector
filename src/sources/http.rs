@@ -14,12 +14,12 @@ use tower_http::decompression::RequestDecompressionLayer;
 use tracing::{info, warn};
 use metrics;
 
-use crate::event::{value_from_json, Event};
+use crate::event::{value_from_json, Event, EventEnvelope};
 use crate::sources::Source;
 
 #[derive(Clone)]
 pub struct HttpSourceState {
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<EventEnvelope>,
     name: String,
 }
 
@@ -35,29 +35,35 @@ impl HttpSource {
     }
 }
 
-async fn send_object(component: &str, obj: serde_json::Map<String, JsonValue>, tx: &mpsc::Sender<Event>) {
+async fn send_object(
+    component: &str,
+    obj: serde_json::Map<String, JsonValue>,
+    tx: &mpsc::Sender<EventEnvelope>,
+) {
     let mut event = Event::new();
     for (k, v) in obj {
         event.insert(k, value_from_json(&v));
     }
-    if let Err(err) = tx.send(event).await {
+    let envelope = EventEnvelope::with_source(event, component.to_string());
+    if let Err(err) = tx.send(envelope).await {
         warn!("HttpSource: failed to send event: {}", err);
     } else {
         metrics::increment_counter!("events_out", "component" => component.to_string());
     }
 }
 
-async fn send_message(component: &str, msg: String, tx: &mpsc::Sender<Event>) {
+async fn send_message(component: &str, msg: String, tx: &mpsc::Sender<EventEnvelope>) {
     let mut event = Event::new();
     event.insert("message", msg);
-    if let Err(err) = tx.send(event).await {
+    let envelope = EventEnvelope::with_source(event, component.to_string());
+    if let Err(err) = tx.send(envelope).await {
         warn!("HttpSource: failed to send message event: {}", err);
     } else {
         metrics::increment_counter!("events_out", "component" => component.to_string());
     }
 }
 
-async fn handle_json_value(component: &str, val: JsonValue, tx: &mpsc::Sender<Event>) {
+async fn handle_json_value(component: &str, val: JsonValue, tx: &mpsc::Sender<EventEnvelope>) {
     match val {
         JsonValue::Object(map) => send_object(component, map, tx).await,
         JsonValue::Array(arr) => {
@@ -73,7 +79,7 @@ async fn handle_json_value(component: &str, val: JsonValue, tx: &mpsc::Sender<Ev
     }
 }
 
-async fn parse_ndjson(component: &str, body: &str, tx: &mpsc::Sender<Event>) {
+async fn parse_ndjson(component: &str, body: &str, tx: &mpsc::Sender<EventEnvelope>) {
     for line in body.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -144,7 +150,7 @@ async fn http_source_handler(
 
 #[async_trait]
 impl Source for HttpSource {
-    async fn run(self: Box<Self>, tx: mpsc::Sender<Event>, mut shutdown: broadcast::Receiver<()>) {
+    async fn run(self: Box<Self>, tx: mpsc::Sender<EventEnvelope>, mut shutdown: broadcast::Receiver<()>) {
         info!(
             "HttpSource[{}] listening on http://{}{}",
             self.name, self.addr, self.path
