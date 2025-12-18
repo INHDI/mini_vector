@@ -6,6 +6,7 @@ use crate::transforms::Transform;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub enum Condition {
@@ -599,28 +600,35 @@ impl Transform for ScriptTransform {
         self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(mut event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(mut event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
 
-            if self.apply_ops(&self.ops, &mut event.event) {
-                match output.send(event).await {
-                    Ok(_) => {
-                        metrics::increment_counter!("events_out", "component" => self.name.clone())
-                    }
-                    Err(err) => {
-                        let ev = err.0;
-                        ev.ack.ack();
-                        break;
+                    if self.apply_ops(&self.ops, &mut event.event) {
+                        match output.send(event).await {
+                            Ok(_) => {
+                                metrics::increment_counter!("events_out", "component" => self.name.clone())
+                            }
+                            Err(err) => {
+                                let ev = err.0;
+                                ev.ack.ack();
+                                break;
+                            }
+                        }
+                    } else {
+                        metrics::increment_counter!(
+                           "events_dropped",
+                           "component" => self.name.clone(),
+                           "reason" => "script_drop"
+                        );
+                        event.ack.ack();
                     }
                 }
-            } else {
-                metrics::increment_counter!(
-                   "events_dropped",
-                   "component" => self.name.clone(),
-                   "reason" => "script_drop"
-                );
-                event.ack.ack();
             }
         }
     }
@@ -629,6 +637,7 @@ impl Transform for ScriptTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn parse_assignment_extended_funcs() {
@@ -722,7 +731,9 @@ mod tests {
         tx_in.send(event).await.unwrap();
         drop(tx_in);
 
-        Box::new(t).run(rx_in, tx_out).await;
+        Box::new(t)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
 
         let event = rx_out.recv().await.expect("should output");
         let log = event.event.as_log().unwrap();

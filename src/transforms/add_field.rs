@@ -2,6 +2,7 @@ use crate::event::{EventEnvelope, Value};
 use crate::transforms::Transform;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub struct AddFieldTransform {
     pub name: String,
@@ -21,20 +22,27 @@ impl Transform for AddFieldTransform {
         self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(mut event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(mut event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
 
-            event.event.insert(self.field.clone(), self.value.clone());
+                    event.event.insert(self.field.clone(), self.value.clone());
 
-            match output.send(event).await {
-                Ok(_) => {
-                    metrics::increment_counter!("events_out", "component" => self.name.clone());
-                }
-                Err(err) => {
-                    let ev = err.0;
-                    ev.ack.ack();
-                    break;
+                    match output.send(event).await {
+                        Ok(_) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone());
+                        }
+                        Err(err) => {
+                            let ev = err.0;
+                            ev.ack.ack();
+                            break;
+                        }
+                    }
                 }
             }
         }

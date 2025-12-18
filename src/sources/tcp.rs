@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use metrics;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::event::{Event, EventEnvelope};
@@ -27,7 +28,7 @@ impl TcpSource {
         &self,
         stream: TcpStream,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         let peer = stream
             .peer_addr()
@@ -62,7 +63,7 @@ impl TcpSource {
                         }
                     }
                 }
-                _ = shutdown.recv() => break,
+                _ = shutdown.cancelled() => break,
             }
         }
     }
@@ -73,7 +74,7 @@ impl Source for TcpSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         let listener = match TcpListener::bind(&self.address).await {
             Ok(l) => l,
@@ -93,7 +94,7 @@ impl Source for TcpSource {
                     match res {
                         Ok((stream, _)) => {
                             let tx_conn = tx.clone();
-                            let shutdown_conn = shutdown.resubscribe();
+                            let shutdown_conn = shutdown.clone();
                             let src = self.clone();
                             tokio::spawn(async move {
                                 src.handle_conn(stream, tx_conn, shutdown_conn).await;
@@ -102,7 +103,7 @@ impl Source for TcpSource {
                         Err(err) => warn!("TcpSource[{}] accept error: {}", self.name, err),
                     }
                 }
-                _ = shutdown.recv() => {
+                _ = shutdown.cancelled() => {
                     info!("TcpSource[{}] shutdown", self.name);
                     break;
                 }

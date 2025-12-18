@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use metrics;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use vrl::compiler::{self, TargetValueRef, TimeZone, runtime::Runtime, state::RuntimeState};
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
@@ -79,79 +80,86 @@ impl Transform for RouteTransform {
         mut self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
-            let mut any_matched = false;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
+                    let mut any_matched = false;
 
-            for idx in 0..self.routes.len() {
-                match self.eval_rule(idx, &event.event) {
-                    Ok(true) => {
-                        any_matched = true;
-                        let rule = &self.routes[idx];
-                        for target in &rule.outputs {
-                            let mut ev_clone = event.clone();
-                            let Event::Log(LogEvent { fields }) = &mut ev_clone.event;
-                            fields.insert(
-                                "__route_target".to_string(),
-                                Value::String(target.clone()),
-                            );
-                            match output.send(ev_clone).await {
-                                Ok(_) => {
-                                    metrics::increment_counter!(
-                                        "events_out",
-                                        "component" => self.name.clone(),
-                                        "route" => rule.name.clone()
+                    for idx in 0..self.routes.len() {
+                        match self.eval_rule(idx, &event.event) {
+                            Ok(true) => {
+                                any_matched = true;
+                                let rule = &self.routes[idx];
+                                for target in &rule.outputs {
+                                    let mut ev_clone = event.clone();
+                                    let Event::Log(LogEvent { fields }) = &mut ev_clone.event;
+                                    fields.insert(
+                                        "__route_target".to_string(),
+                                        Value::String(target.clone()),
                                     );
-                                }
-                                Err(err) => {
-                                    let ev = err.0;
-                                    ev.ack.ack();
+                                    match output.send(ev_clone).await {
+                                        Ok(_) => {
+                                            metrics::increment_counter!(
+                                                "events_out",
+                                                "component" => self.name.clone(),
+                                                "route" => rule.name.clone()
+                                            );
+                                        }
+                                        Err(err) => {
+                                            let ev = err.0;
+                                            ev.ack.ack();
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        metrics::increment_counter!(
-                            "events_dropped",
-                            "component" => self.name.clone(),
-                            "reason" => "route_eval_error"
-                        );
-                        tracing::warn!(target = "transform.route", name = %self.name, %err, "route evaluation error");
-                    }
-                }
-            }
-
-            if !any_matched {
-                if !self.default_outputs.is_empty() {
-                    for target in &self.default_outputs {
-                        let mut ev_clone = event.clone();
-                        let Event::Log(LogEvent { fields }) = &mut ev_clone.event;
-                        fields.insert("__route_target".to_string(), Value::String(target.clone()));
-                        match output.send(ev_clone).await {
-                            Ok(_) => {
-                                metrics::increment_counter!(
-                                    "events_out",
-                                    "component" => self.name.clone(),
-                                    "route" => "default"
-                                );
-                            }
+                            Ok(false) => {}
                             Err(err) => {
-                                let ev = err.0;
-                                ev.ack.ack();
+                                metrics::increment_counter!(
+                                    "events_dropped",
+                                    "component" => self.name.clone(),
+                                    "reason" => "route_eval_error"
+                                );
+                                tracing::warn!(target = "transform.route", name = %self.name, %err, "route evaluation error");
                             }
                         }
                     }
-                } else {
-                    metrics::increment_counter!(
-                        "events_dropped",
-                        "component" => self.name.clone(),
-                        "reason" => "no_route"
-                    );
+
+                    if !any_matched {
+                        if !self.default_outputs.is_empty() {
+                            for target in &self.default_outputs {
+                                let mut ev_clone = event.clone();
+                                let Event::Log(LogEvent { fields }) = &mut ev_clone.event;
+                                fields.insert("__route_target".to_string(), Value::String(target.clone()));
+                                match output.send(ev_clone).await {
+                                    Ok(_) => {
+                                        metrics::increment_counter!(
+                                            "events_out",
+                                            "component" => self.name.clone(),
+                                            "route" => "default"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        let ev = err.0;
+                                        ev.ack.ack();
+                                    }
+                                }
+                            }
+                        } else {
+                            metrics::increment_counter!(
+                                "events_dropped",
+                                "component" => self.name.clone(),
+                                "reason" => "no_route"
+                            );
+                        }
+                    }
+                    event.ack.ack();
                 }
             }
-            event.ack.ack();
         }
     }
 }
@@ -193,6 +201,7 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
     use tokio::time::{Duration, timeout};
+    use tokio_util::sync::CancellationToken;
 
     fn event_with_type(ty: &str) -> EventEnvelope {
         let mut ev = Event::new();
@@ -212,9 +221,12 @@ mod tests {
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
+        let shutdown = CancellationToken::new();
 
         tokio::spawn(async move {
-            Box::new(t).run(rx_in, tx_out).await;
+            Box::new(t)
+                .run(rx_in, tx_out, shutdown.clone())
+                .await;
         });
 
         tx_in.send(event_with_type("web")).await.unwrap();

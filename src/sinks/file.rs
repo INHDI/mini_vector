@@ -3,6 +3,7 @@ use chrono::Utc;
 use metrics;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::event::EventEnvelope;
@@ -69,24 +70,30 @@ impl FileSink {
 
 #[async_trait]
 impl Sink for FileSink {
-    async fn run(mut self: Box<Self>, rx: SinkReceiver) {
+    async fn run(mut self: Box<Self>, rx: SinkReceiver, shutdown: CancellationToken) {
         info!("FileSink[{}] writing to {}", self.name, self.path);
-        while let Some(event) = rx.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
-            match self.write_event(&event).await {
-                Ok(()) => {
-                    metrics::increment_counter!("events_out", "component" => self.name.clone());
-                }
-                Err(err) => {
-                    error!("FileSink[{}] write error: {}", self.name, err);
-                    metrics::increment_counter!(
-                        "events_failed",
-                        "component" => self.name.clone(),
-                        "reason" => "write_error"
-                    );
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = rx.recv() => {
+                    let Some(event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
+                    match self.write_event(&event).await {
+                        Ok(()) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone());
+                        }
+                        Err(err) => {
+                            error!("FileSink[{}] write error: {}", self.name, err);
+                            metrics::increment_counter!(
+                                "events_failed",
+                                "component" => self.name.clone(),
+                                "reason" => "write_error"
+                            );
+                        }
+                    }
+                    event.ack.ack();
                 }
             }
-            event.ack.ack();
         }
         if let Err(err) = self.writer.flush().await {
             warn!("FileSink[{}] flush error: {}", self.name, err);

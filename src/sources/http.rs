@@ -10,7 +10,8 @@ use axum::{
 use bytes::Bytes;
 use metrics;
 use serde_json::Value as JsonValue;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::{info, warn};
 
@@ -153,7 +154,7 @@ impl Source for HttpSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         info!(
             "HttpSource[{}] listening on http://{}{}",
@@ -177,10 +178,11 @@ impl Source for HttpSource {
             }
         };
 
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-            let _ = shutdown.recv().await;
-            info!("HttpSource received shutdown signal");
-        });
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+                info!("HttpSource received shutdown signal");
+            });
 
         if let Err(err) = server.await {
             warn!("HttpSource error: {}", err);

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use vrl::compiler::{self, TargetValueRef, TimeZone, runtime::Runtime, state::RuntimeState};
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
@@ -174,56 +175,63 @@ impl Transform for RemapTransform {
         mut self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(mut event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(mut event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
 
-            match self.process_one(&mut event.event).await {
-                Ok(()) => {
-                    metrics::increment_counter!("events_out", "component" => self.name.clone());
-                    match output.send(event).await {
-                        Ok(_) => {}
-                        Err(err) => {
-                            let ev = err.0;
-                            ev.ack.ack();
-                            break;
-                        }
-                    }
-                }
-                Err(err) => {
-                    let err_msg = err.to_string();
-                    event.event.insert(
-                        "transform_error".to_string(),
-                        Value::String(err_msg.clone()),
-                    );
-                    event.event.insert(
-                        "transform_error_stage".to_string(),
-                        Value::String("remap".to_string()),
-                    );
-                    if self.drop_on_error {
-                        tracing::warn!(target = "transform.remap", name = %self.name, %err_msg, "VRL transform failed");
-                        metrics::increment_counter!(
-                            "events_dropped",
-                            "component" => self.name.clone(),
-                            "reason" => "vrl_error"
-                        );
-                        event.ack.ack();
-                        continue;
-                    } else {
-                        tracing::warn!(target = "transform.remap", name = %self.name, %err_msg, "VRL transform failed, attaching error_field");
-                        self.attach_error_field(&mut event.event, err_msg);
-                        metrics::increment_counter!("events_out", "component" => self.name.clone());
-                        match output.send(event).await {
-                            Ok(_) => {}
-                            Err(err) => {
-                                let ev = err.0;
-                                ev.ack.ack();
-                                break;
+                    match self.process_one(&mut event.event).await {
+                        Ok(()) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone());
+                            match output.send(event).await {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    let ev = err.0;
+                                    ev.ack.ack();
+                                    break;
+                                }
                             }
                         }
-                    }
+                        Err(err) => {
+                            let err_msg = err.to_string();
+                            event.event.insert(
+                                "transform_error".to_string(),
+                                Value::String(err_msg.clone()),
+                            );
+                            event.event.insert(
+                                "transform_error_stage".to_string(),
+                                Value::String("remap".to_string()),
+                            );
+                            if self.drop_on_error {
+                                tracing::warn!(target = "transform.remap", name = %self.name, %err_msg, "VRL transform failed");
+                                metrics::increment_counter!(
+                                    "events_dropped",
+                                    "component" => self.name.clone(),
+                                    "reason" => "vrl_error"
+                                );
+                                event.ack.ack();
+                                continue;
+                            } else {
+                                tracing::warn!(target = "transform.remap", name = %self.name, %err_msg, "VRL transform failed, attaching error_field");
+                                self.attach_error_field(&mut event.event, err_msg);
+                                metrics::increment_counter!("events_out", "component" => self.name.clone());
+                                match output.send(event).await {
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        let ev = err.0;
+                                        ev.ack.ack();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    };
                 }
-            };
+            }
         }
     }
 }
@@ -233,6 +241,7 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
     use tokio::time::{Duration, timeout};
+    use tokio_util::sync::CancellationToken;
 
     fn event_with_message(msg: &str) -> EventEnvelope {
         let mut ev = Event::new();
@@ -248,9 +257,12 @@ mod tests {
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
+        let shutdown = CancellationToken::new();
 
         tokio::spawn(async move {
-            Box::new(t).run(rx_in, tx_out).await;
+            Box::new(t)
+                .run(rx_in, tx_out, shutdown.clone())
+                .await;
         });
 
         tx_in.send(event_with_message("hello")).await.unwrap();
@@ -270,9 +282,12 @@ mod tests {
 
         let (tx_in, rx_in) = mpsc::channel(4);
         let (tx_out, mut rx_out) = mpsc::channel(4);
+        let shutdown = CancellationToken::new();
 
         tokio::spawn(async move {
-            Box::new(t).run(rx_in, tx_out).await;
+            Box::new(t)
+                .run(rx_in, tx_out, shutdown.clone())
+                .await;
         });
 
         tx_in.send(event_with_message("hello")).await.unwrap();

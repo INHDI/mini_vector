@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use metrics;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::event::{Event, EventEnvelope};
@@ -21,7 +22,7 @@ impl Source for StdinSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         use tokio::io::{self, AsyncBufReadExt};
 
@@ -51,7 +52,7 @@ impl Source for StdinSource {
                         }
                     }
                 }
-                _ = shutdown.recv() => {
+                _ = shutdown.cancelled() => {
                     info!("StdinSource[{}] received shutdown signal", self.name);
                     break;
                 }
