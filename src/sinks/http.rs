@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use metrics;
 use std::time::Duration;
 use tracing::{info, warn};
+use tokio_util::sync::CancellationToken;
 
 use crate::batcher::{Batch, Batcher};
 use crate::config::BatchConfig;
@@ -123,7 +124,7 @@ impl HttpSink {
 
 #[async_trait]
 impl Sink for HttpSink {
-    async fn run(self: Box<Self>, rx: SinkReceiver) {
+    async fn run(self: Box<Self>, rx: SinkReceiver, shutdown: CancellationToken) {
         info!(
             "HttpSink[{}] started, endpoint={}",
             self.name, self.endpoint
@@ -135,6 +136,12 @@ impl Sink for HttpSink {
             let timeout = batcher.remaining_time();
 
             tokio::select! {
+                _ = shutdown.cancelled() => {
+                    if batcher.should_flush() {
+                        self.send_batch(batcher.take()).await;
+                    }
+                    break;
+                }
                 maybe_event = rx.recv() => {
                     match maybe_event {
                         Some(event) => {

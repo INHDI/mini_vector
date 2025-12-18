@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use metrics;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::event::{Event, EventEnvelope};
@@ -28,7 +29,7 @@ impl SyslogSource {
     async fn run_udp(
         &self,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         let socket = match UdpSocket::bind(&self.address).await {
             Ok(s) => s,
@@ -67,7 +68,7 @@ impl SyslogSource {
                         }
                     }
                 }
-                _ = shutdown.recv() => {
+                _ = shutdown.cancelled() => {
                     info!("SyslogSource[{}] shutdown", self.name);
                     break;
                 }
@@ -79,7 +80,7 @@ impl SyslogSource {
         &self,
         stream: TcpStream,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         let peer = stream
             .peer_addr()
@@ -114,7 +115,7 @@ impl SyslogSource {
                         }
                     }
                 }
-                _ = shutdown.recv() => break,
+                _ = shutdown.cancelled() => break,
             }
         }
     }
@@ -122,7 +123,7 @@ impl SyslogSource {
     async fn run_tcp(
         &self,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         let listener = match TcpListener::bind(&self.address).await {
             Ok(l) => l,
@@ -144,7 +145,7 @@ impl SyslogSource {
                     match res {
                         Ok((stream, _)) => {
                             let tx_conn = tx.clone();
-                            let shutdown_conn = shutdown.resubscribe();
+                            let shutdown_conn = shutdown.clone();
                             let src = self.clone();
                             tokio::spawn(async move {
                                 src.handle_tcp_conn(stream, tx_conn, shutdown_conn).await;
@@ -155,7 +156,7 @@ impl SyslogSource {
                         }
                     }
                 }
-                _ = shutdown.recv() => {
+                _ = shutdown.cancelled() => {
                     info!("SyslogSource[{}] shutdown", self.name);
                     break;
                 }
@@ -180,7 +181,7 @@ impl Source for SyslogSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<EventEnvelope>,
-        shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         match self.mode.as_str() {
             "udp" => self.run_udp(tx, shutdown).await,

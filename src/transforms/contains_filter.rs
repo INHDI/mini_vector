@@ -2,6 +2,7 @@ use crate::event::EventEnvelope;
 use crate::transforms::Transform;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub struct ContainsFilterTransform {
     pub name: String,
@@ -25,34 +26,41 @@ impl Transform for ContainsFilterTransform {
         self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
 
-            let keep = if let Some(v) = event.event.get_str(&self.field) {
-                v.contains(&self.needle)
-            } else {
-                false
-            };
+                    let keep = if let Some(v) = event.event.get_str(&self.field) {
+                        v.contains(&self.needle)
+                    } else {
+                        false
+                    };
 
-            if keep {
-                match output.send(event).await {
-                    Ok(_) => {
-                        metrics::increment_counter!("events_out", "component" => self.name.clone());
-                    }
-                    Err(err) => {
-                        let ev = err.0;
-                        ev.ack.ack();
-                        break;
+                    if keep {
+                        match output.send(event).await {
+                            Ok(_) => {
+                                metrics::increment_counter!("events_out", "component" => self.name.clone());
+                            }
+                            Err(err) => {
+                                let ev = err.0;
+                                ev.ack.ack();
+                                break;
+                            }
+                        }
+                    } else {
+                        metrics::increment_counter!(
+                            "events_dropped",
+                            "component" => self.name.clone(),
+                            "reason" => "filtered_out"
+                        );
+                        event.ack.ack();
                     }
                 }
-            } else {
-                metrics::increment_counter!(
-                    "events_dropped",
-                    "component" => self.name.clone(),
-                    "reason" => "filtered_out"
-                );
-                event.ack.ack();
             }
         }
     }

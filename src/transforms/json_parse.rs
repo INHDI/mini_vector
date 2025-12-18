@@ -2,6 +2,7 @@ use crate::event::{Event, EventEnvelope, value_from_json};
 use crate::transforms::Transform;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 pub struct JsonParseTransform {
@@ -36,98 +37,52 @@ impl Transform for JsonParseTransform {
         self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(mut event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(mut event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
 
-            let raw = match event.event.get_str(&self.from_field) {
-                Some(s) => s.to_string(),
-                None => {
-                    warn!(
-                        "JsonParseTransform: source field '{}' missing or not string",
-                        self.from_field
-                    );
-                    if self.drop_on_error {
-                        metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "missing_field");
-                        event.ack.ack();
-                        continue;
-                    } else {
-                        event
-                            .event
-                            .insert("json_parse_error".to_string(), "missing_source_field");
-                        match output.send(event).await {
-                            Ok(_) => {
-                                metrics::increment_counter!("events_out", "component" => self.name.clone());
+                    let raw = match event.event.get_str(&self.from_field) {
+                        Some(s) => s.to_string(),
+                        None => {
+                            warn!(
+                                "JsonParseTransform: source field '{}' missing or not string",
+                                self.from_field
+                            );
+                            if self.drop_on_error {
+                                metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "missing_field");
+                                event.ack.ack();
+                                continue;
+                            } else {
+                                event
+                                    .event
+                                    .insert("json_parse_error".to_string(), "missing_source_field");
+                                match output.send(event).await {
+                                    Ok(_) => {
+                                        metrics::increment_counter!("events_out", "component" => self.name.clone());
+                                    }
+                                    Err(err) => {
+                                        let ev = err.0;
+                                        ev.ack.ack();
+                                        break;
+                                    }
+                                }
+                                continue;
                             }
-                            Err(err) => {
-                                let ev = err.0;
-                                ev.ack.ack();
-                                break;
-                            }
                         }
-                        continue;
-                    }
-                }
-            };
+                    };
 
-            if raw.trim().is_empty() {
-                if self.drop_on_error {
-                    metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "empty_field");
-                    event.ack.ack();
-                    continue;
-                }
-                // pass through
-                match output.send(event).await {
-                    Ok(_) => {
-                        metrics::increment_counter!("events_out", "component" => self.name.clone())
-                    }
-                    Err(err) => {
-                        let ev = err.0;
-                        ev.ack.ack();
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(serde_json::Value::Object(map)) => {
-                    for (k, v) in map {
-                        let key = if let Some(prefix) = &self.target_prefix {
-                            format!("{}.{}", prefix, k)
-                        } else {
-                            k
-                        };
-                        event.event.insert(key, value_from_json(&v));
-                    }
-                    if self.remove_source {
-                        let Event::Log(log) = &mut event.event;
-                        log.fields.remove(&self.from_field);
-                    }
-
-                    match output.send(event).await {
-                        Ok(_) => {
-                            metrics::increment_counter!("events_out", "component" => self.name.clone())
+                    if raw.trim().is_empty() {
+                        if self.drop_on_error {
+                            metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "empty_field");
+                            event.ack.ack();
+                            continue;
                         }
-                        Err(err) => {
-                            let ev = err.0;
-                            ev.ack.ack();
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "JsonParseTransform: failed to parse '{}' as JSON: {}",
-                        self.from_field, e
-                    );
-                    if self.drop_on_error {
-                        metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "parse_error");
-                        event.ack.ack();
-                    } else {
-                        event
-                            .event
-                            .insert("json_parse_error".to_string(), e.to_string());
+                        // pass through
                         match output.send(event).await {
                             Ok(_) => {
                                 metrics::increment_counter!("events_out", "component" => self.name.clone())
@@ -138,24 +93,77 @@ impl Transform for JsonParseTransform {
                                 break;
                             }
                         }
+                        continue;
                     }
-                }
-                _ => {
-                    if self.drop_on_error {
-                        metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "not_object");
-                        event.ack.ack();
-                    } else {
-                        event
-                            .event
-                            .insert("json_parse_error".to_string(), "not_a_json_object");
-                        match output.send(event).await {
-                            Ok(_) => {
-                                metrics::increment_counter!("events_out", "component" => self.name.clone())
+
+                    match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(serde_json::Value::Object(map)) => {
+                            for (k, v) in map {
+                                let key = if let Some(prefix) = &self.target_prefix {
+                                    format!("{}.{}", prefix, k)
+                                } else {
+                                    k
+                                };
+                                event.event.insert(key, value_from_json(&v));
                             }
-                            Err(err) => {
-                                let ev = err.0;
-                                ev.ack.ack();
-                                break;
+                            if self.remove_source {
+                                let Event::Log(log) = &mut event.event;
+                                log.fields.remove(&self.from_field);
+                            }
+
+                            match output.send(event).await {
+                                Ok(_) => {
+                                    metrics::increment_counter!("events_out", "component" => self.name.clone())
+                                }
+                                Err(err) => {
+                                    let ev = err.0;
+                                    ev.ack.ack();
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "JsonParseTransform: failed to parse '{}' as JSON: {}",
+                                self.from_field, e
+                            );
+                            if self.drop_on_error {
+                                metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "parse_error");
+                                event.ack.ack();
+                            } else {
+                                event
+                                    .event
+                                    .insert("json_parse_error".to_string(), e.to_string());
+                                match output.send(event).await {
+                                    Ok(_) => {
+                                        metrics::increment_counter!("events_out", "component" => self.name.clone())
+                                    }
+                                    Err(err) => {
+                                        let ev = err.0;
+                                        ev.ack.ack();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            if self.drop_on_error {
+                                metrics::increment_counter!("events_dropped", "component" => self.name.clone(), "reason" => "not_object");
+                                event.ack.ack();
+                            } else {
+                                event
+                                    .event
+                                    .insert("json_parse_error".to_string(), "not_a_json_object");
+                                match output.send(event).await {
+                                    Ok(_) => {
+                                        metrics::increment_counter!("events_out", "component" => self.name.clone())
+                                    }
+                                    Err(err) => {
+                                        let ev = err.0;
+                                        ev.ack.ack();
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -170,6 +178,7 @@ mod tests {
     use super::*;
     use crate::event::Value;
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn parses_json_object_into_fields() {
@@ -184,7 +193,9 @@ mod tests {
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
 
-        Box::new(t).run(rx_in, tx_out).await;
+        Box::new(t)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
 
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
@@ -217,7 +228,9 @@ mod tests {
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
 
-        Box::new(t).run(rx_in, tx_out).await;
+        Box::new(t)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
 
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();

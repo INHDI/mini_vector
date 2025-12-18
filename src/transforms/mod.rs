@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::event::EventEnvelope;
 
@@ -19,5 +20,6 @@ pub trait Transform: Send + Sync {
         self: Box<Self>,
         input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     );
 }

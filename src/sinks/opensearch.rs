@@ -5,6 +5,7 @@ use metrics;
 use reqwest::Client;
 use std::collections::HashSet;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::batcher::{Batch, Batcher};
@@ -338,13 +339,19 @@ impl OpenSearchSink {
 
 #[async_trait]
 impl Sink for OpenSearchSink {
-    async fn run(self: Box<Self>, rx: SinkReceiver) {
+    async fn run(self: Box<Self>, rx: SinkReceiver, shutdown: CancellationToken) {
         info!("OpenSearchSink[{}] started", self.name);
         let mut batcher = Batcher::new(self.batch_config.clone());
 
         loop {
             let timeout = batcher.remaining_time();
             tokio::select! {
+                _ = shutdown.cancelled() => {
+                    if batcher.should_flush() {
+                        self.send_bulk_with_retry(batcher.take()).await;
+                    }
+                    break;
+                }
                 maybe_event = rx.recv() => {
                     match maybe_event {
                         Some(event) => {

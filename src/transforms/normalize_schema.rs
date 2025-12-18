@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::event::{Event, EventEnvelope, Value, parse_timestamp};
 use crate::transforms::Transform;
@@ -232,18 +233,25 @@ impl Transform for NormalizeSchemaTransform {
         self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(mut event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
-            self.apply_logic(&mut event.event);
-            match output.send(event).await {
-                Ok(_) => {
-                    metrics::increment_counter!("events_out", "component" => self.name.clone())
-                }
-                Err(err) => {
-                    let ev = err.0;
-                    ev.ack.ack();
-                    break;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(mut event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
+                    self.apply_logic(&mut event.event);
+                    match output.send(event).await {
+                        Ok(_) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone())
+                        }
+                        Err(err) => {
+                            let ev = err.0;
+                            ev.ack.ack();
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -254,6 +262,7 @@ impl Transform for NormalizeSchemaTransform {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn sets_defaults_when_missing() {
@@ -267,7 +276,9 @@ mod tests {
         tx_in.send(event).await.unwrap();
         drop(tx_in);
 
-        Box::new(t).run(rx_in, tx_out).await;
+        Box::new(t)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
 
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
@@ -313,7 +324,9 @@ mod tests {
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
 
-        Box::new(t).run(rx_in, tx_out).await;
+        Box::new(t)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
 
         let event = rx_out.recv().await.expect("should output event");
         let log = event.event.as_log().unwrap();
@@ -357,7 +370,9 @@ mod tests {
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
-        Box::new(t).run(rx_in, tx_out).await;
+        Box::new(t)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
         let event = rx_out.recv().await.unwrap();
 
         assert_eq!(
@@ -380,7 +395,9 @@ mod tests {
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(event).await.unwrap();
         drop(tx_in);
-        Box::new(t2).run(rx_in, tx_out).await;
+        Box::new(t2)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
         let event = rx_out.recv().await.unwrap();
 
         assert_eq!(
@@ -416,7 +433,9 @@ mod tests {
         let (tx_out, mut rx_out) = mpsc::channel(1);
         tx_in.send(envelope).await.unwrap();
         drop(tx_in);
-        Box::new(t).run(rx_in, tx_out).await;
+        Box::new(t)
+            .run(rx_in, tx_out, CancellationToken::new())
+            .await;
         let event = rx_out.recv().await.unwrap();
         let log = event.event.as_log().unwrap();
 

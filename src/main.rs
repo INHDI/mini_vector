@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use axum::{Router, routing::get};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::health::HealthState;
@@ -34,9 +35,22 @@ async fn main() -> anyhow::Result<()> {
         .parse::<u16>()
         .unwrap_or(9100);
 
+    let shutdown = CancellationToken::new();
+
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                warn!("Ctrl+C received, shutting down...");
+                shutdown.cancel();
+            }
+        });
+    }
+
     // Spawn Metrics & Health server
     let health = HealthState::new();
     let health_clone = health.clone();
+    let metrics_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let app = Router::new()
             .route("/metrics", get(move || std::future::ready(handle.render())))
@@ -46,14 +60,20 @@ async fn main() -> anyhow::Result<()> {
                     let healthy = health_clone.is_healthy(60);
                     async move { if healthy { "UP" } else { "DOWN" } }
                 }),
-            );
+        );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
         info!("Metrics and Health API listening on {}", addr);
 
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                if let Err(e) = axum::serve(listener, app).await {
+                let shutdown_signal = metrics_shutdown.clone();
+                if let Err(e) = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        shutdown_signal.cancelled().await;
+                    })
+                    .await
+                {
                     warn!("Metrics server error: {}", e);
                 }
             }
@@ -69,5 +89,5 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("mini_vector.yml"));
 
     let manager = PipelineManager::new(config_path, health);
-    manager.run().await
+    manager.run(shutdown).await
 }

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use metrics;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use vrl::compiler::{self, TargetValueRef, TimeZone, runtime::Runtime, state::RuntimeState};
 use vrl::stdlib;
 use vrl::value::{KeyString, Secrets, Value as VrlValue};
@@ -108,67 +109,74 @@ impl Transform for DetectTransform {
         mut self: Box<Self>,
         mut input: mpsc::Receiver<EventEnvelope>,
         output: mpsc::Sender<EventEnvelope>,
+        shutdown: CancellationToken,
     ) {
-        while let Some(mut event) = input.recv().await {
-            metrics::increment_counter!("events_in", "component" => self.name.clone());
-            for rule in &mut self.rules {
-                match Self::apply_rule(rule, &event.event) {
-                    Ok(true) => {
-                        let Event::Log(LogEvent { fields }) = &mut event.event;
-                        fields.insert("alert".to_string(), Value::Bool(true));
-                        fields.insert("rule_id".to_string(), Value::String(rule.meta.id.clone()));
-                        fields.insert(
-                            "rule_name".to_string(),
-                            Value::String(rule.meta.name.clone()),
-                        );
-                        fields.insert(
-                            "alert_severity".to_string(),
-                            Value::String(rule.meta.severity.clone()),
-                        );
-                        if !rule.meta.description.is_empty() {
-                            fields.insert(
-                                "rule_description".to_string(),
-                                Value::String(rule.meta.description.clone()),
-                            );
-                        }
-                        metrics::increment_counter!(
-                            "alerts_fired",
-                            "component" => self.name.clone(),
-                            "rule_id" => rule.meta.id.clone()
-                        );
-                        for target in &self.alert_outputs {
-                            let mut cloned = event.clone();
-                            let Event::Log(LogEvent { fields }) = &mut cloned.event;
-                            fields.insert(
-                                "__route_target".to_string(),
-                                Value::String(target.clone()),
-                            );
-                            if let Err(err) = output.send(cloned).await {
-                                err.0.ack.ack();
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                maybe = input.recv() => {
+                    let Some(mut event) = maybe else { break };
+                    metrics::increment_counter!("events_in", "component" => self.name.clone());
+                    for rule in &mut self.rules {
+                        match Self::apply_rule(rule, &event.event) {
+                            Ok(true) => {
+                                let Event::Log(LogEvent { fields }) = &mut event.event;
+                                fields.insert("alert".to_string(), Value::Bool(true));
+                                fields.insert("rule_id".to_string(), Value::String(rule.meta.id.clone()));
+                                fields.insert(
+                                    "rule_name".to_string(),
+                                    Value::String(rule.meta.name.clone()),
+                                );
+                                fields.insert(
+                                    "alert_severity".to_string(),
+                                    Value::String(rule.meta.severity.clone()),
+                                );
+                                if !rule.meta.description.is_empty() {
+                                    fields.insert(
+                                        "rule_description".to_string(),
+                                        Value::String(rule.meta.description.clone()),
+                                    );
+                                }
+                                metrics::increment_counter!(
+                                    "alerts_fired",
+                                    "component" => self.name.clone(),
+                                    "rule_id" => rule.meta.id.clone()
+                                );
+                                for target in &self.alert_outputs {
+                                    let mut cloned = event.clone();
+                                    let Event::Log(LogEvent { fields }) = &mut cloned.event;
+                                    fields.insert(
+                                        "__route_target".to_string(),
+                                        Value::String(target.clone()),
+                                    );
+                                    if let Err(err) = output.send(cloned).await {
+                                        err.0.ack.ack();
+                                    }
+                                    metrics::increment_counter!("events_out", "component" => self.name.clone());
+                                }
+                                break;
                             }
-                            metrics::increment_counter!("events_out", "component" => self.name.clone());
+                            Ok(false) => {}
+                            Err(err) => {
+                                metrics::increment_counter!(
+                                    "events_failed",
+                                    "component" => self.name.clone(),
+                                    "reason" => "rule_error"
+                                );
+                                tracing::warn!(target = "transform.detect", name = %self.name, %err, "rule evaluation failed");
+                            }
                         }
-                        break;
                     }
-                    Ok(false) => {}
-                    Err(err) => {
-                        metrics::increment_counter!(
-                            "events_failed",
-                            "component" => self.name.clone(),
-                            "reason" => "rule_error"
-                        );
-                        tracing::warn!(target = "transform.detect", name = %self.name, %err, "rule evaluation failed");
-                    }
-                }
-            }
 
-            match output.send(event).await {
-                Ok(_) => {
-                    metrics::increment_counter!("events_out", "component" => self.name.clone())
-                }
-                Err(err) => {
-                    err.0.ack.ack();
-                    break;
+                    match output.send(event).await {
+                        Ok(_) => {
+                            metrics::increment_counter!("events_out", "component" => self.name.clone())
+                        }
+                        Err(err) => {
+                            err.0.ack.ack();
+                            break;
+                        }
+                    }
                 }
             }
         }

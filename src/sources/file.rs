@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use glob::glob;
 use metrics;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::{ReadFrom, SourceConfig};
@@ -143,7 +144,7 @@ impl Source for FileSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<EventEnvelope>,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         info!(
             "FileSource[{}] starting with patterns: {:?}",
@@ -276,7 +277,7 @@ impl Source for FileSource {
                         &mut state_cache,
                     ).await;
                 }
-                _ = shutdown.recv() => {
+                _ = shutdown.cancelled() => {
                     info!("FileSource[{}] received shutdown signal", self.name);
                     break;
                 }

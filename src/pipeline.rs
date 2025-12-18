@@ -1,9 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::task;
-use tracing::{info, warn};
+use tokio::time::{timeout, Duration};
+use tracing::warn;
 
 use crate::config::{FullConfig, SinkBufferConfig, SinkConfig, SourceConfig, TransformConfig};
 use crate::event::{Event, EventEnvelope, Value};
@@ -31,6 +32,8 @@ use crate::transforms::regex_parse::RegexParseTransform;
 use crate::transforms::remap::RemapTransform;
 use crate::transforms::route::RouteTransform;
 use crate::transforms::script::ScriptTransform;
+
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_CHANNEL_SIZE: usize = 1024;
 
@@ -431,14 +434,24 @@ async fn fan_out(event: EventEnvelope, downstreams: &[Downstream]) {
     event.ack.ack();
 }
 
-fn merge_inputs(inputs: Vec<mpsc::Receiver<EventEnvelope>>) -> mpsc::Receiver<EventEnvelope> {
+fn merge_inputs(
+    inputs: Vec<mpsc::Receiver<EventEnvelope>>,
+    shutdown: CancellationToken,
+) -> mpsc::Receiver<EventEnvelope> {
     let (tx, rx) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
     for mut r in inputs {
         let tx_clone = tx.clone();
+        let sd = shutdown.clone();
         task::spawn(async move {
-            while let Some(ev) = r.recv().await {
-                if tx_clone.send(ev).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    _ = sd.cancelled() => break,
+                    maybe = r.recv() => {
+                        let Some(ev) = maybe else { break };
+                        if tx_clone.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -448,32 +461,11 @@ fn merge_inputs(inputs: Vec<mpsc::Receiver<EventEnvelope>>) -> mpsc::Receiver<Ev
 
 pub async fn run_pipeline(
     config: FullConfig,
-    external_shutdown: Option<broadcast::Receiver<()>>,
+    shutdown: CancellationToken,
     health: crate::health::HealthState,
 ) -> anyhow::Result<()> {
     let graph = build_graph(&config)?;
-
-    // Shutdown signal
-    let (shutdown_tx, _) = broadcast::channel(1);
-
-    // Spawn signal handler
-    let shutdown_tx_clone = shutdown_tx.clone();
-    task::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("Received Ctrl+C, shutting down...");
-            let _ = shutdown_tx_clone.send(());
-        }
-    });
-
-    // External shutdown (reload/drain)
-    if let Some(mut rx) = external_shutdown {
-        let shutdown_tx_external = shutdown_tx.clone();
-        task::spawn(async move {
-            if rx.recv().await.is_ok() {
-                let _ = shutdown_tx_external.send(());
-            }
-        });
-    }
+    let pipeline_shutdown = shutdown.child_token();
 
     // Build sink queues
     let mut sink_channels: HashMap<String, SinkSender> = HashMap::new();
@@ -551,8 +543,9 @@ pub async fn run_pipeline(
     for (name, scfg) in &config.sinks {
         let sink = build_sink(name, scfg, &health).await?;
         if let Some(rx) = sink_receivers.remove(name) {
+            let sd = pipeline_shutdown.clone();
             sink_tasks.push(task::spawn(async move {
-                sink.run(rx).await;
+                sink.run(rx, sd).await;
             }));
         }
     }
@@ -567,18 +560,29 @@ pub async fn run_pipeline(
                 let merged_rx = if inputs.len() == 1 {
                     inputs.remove(0)
                 } else {
-                    merge_inputs(inputs)
+                    merge_inputs(inputs, pipeline_shutdown.clone())
                 };
 
                 let (tx_out, mut rx_out) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
 
+                let shutdown_clone = pipeline_shutdown.clone();
                 transform_tasks.push(task::spawn(async move {
-                    t.run(merged_rx, tx_out).await;
+                    t.run(merged_rx, tx_out, shutdown_clone).await;
                 }));
 
+                let fanout_shutdown = pipeline_shutdown.clone();
                 transform_tasks.push(task::spawn(async move {
-                    while let Some(event) = rx_out.recv().await {
-                        fan_out(event, &downs).await;
+                    loop {
+                        tokio::select! {
+                            _ = fanout_shutdown.cancelled() => break,
+                            maybe = rx_out.recv() => {
+                                if let Some(event) = maybe {
+                                    fan_out(event, &downs).await;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }));
             } else {
@@ -594,27 +598,42 @@ pub async fn run_pipeline(
         let downs = downstreams.get(name).cloned().unwrap_or_default();
         let (tx, mut rx) = mpsc::channel::<EventEnvelope>(DEFAULT_CHANNEL_SIZE);
 
-        let shutdown_rx = shutdown_tx.subscribe();
+        let source_shutdown = pipeline_shutdown.clone();
         source_tasks.push(task::spawn(async move {
-            src.run(tx, shutdown_rx).await;
+            src.run(tx, source_shutdown).await;
         }));
+
+        let fanout_shutdown = pipeline_shutdown.clone();
         source_tasks.push(task::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                fan_out(event, &downs).await;
+            loop {
+                tokio::select! {
+                    _ = fanout_shutdown.cancelled() => break,
+                    maybe = rx.recv() => {
+                        if let Some(event) = maybe {
+                            fan_out(event, &downs).await;
+                        } else {
+                            break;
+                        }
+                    }
+                }
             }
         }));
     }
 
-    // Drop channels to ensure they are closed when all tasks finish
-    for t in source_tasks {
-        let _ = t.await;
-    }
-    for t in transform_tasks {
-        let _ = t.await;
-    }
-    for t in sink_tasks {
-        let _ = t.await;
-    }
+    pipeline_shutdown.cancelled().await;
+
+    let _ = timeout(Duration::from_secs(5), async {
+        for t in source_tasks {
+            let _ = t.await;
+        }
+        for t in transform_tasks {
+            let _ = t.await;
+        }
+        for t in sink_tasks {
+            let _ = t.await;
+        }
+    })
+    .await;
 
     Ok(())
 }
