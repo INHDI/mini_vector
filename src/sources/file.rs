@@ -267,6 +267,14 @@ impl Source for FileSource {
                     ).await {
                         warn!("FileSource[{}] rescan error: {}", self.name, err);
                     }
+
+                    drain_tracked(
+                        &self.name,
+                        &mut tracked,
+                        &tx,
+                        &mut store,
+                        &mut state_cache,
+                    ).await;
                 }
                 _ = shutdown.recv() => {
                     info!("FileSource[{}] received shutdown signal", self.name);
@@ -548,5 +556,20 @@ fn file_key(meta: &std::fs::Metadata) -> (u64, u64) {
     #[cfg(not(target_family = "unix"))]
     {
         (0, meta.len())
+    }
+}
+
+async fn drain_tracked(
+    component: &str,
+    tracked: &mut HashMap<(u64, u64), TrackedFile>,
+    tx: &mpsc::Sender<EventEnvelope>,
+    store: &mut FileStateStore,
+    state_cache: &mut HashMap<(u64, u64), FileState>,
+) {
+    let keys: Vec<(u64, u64)> = tracked.keys().copied().collect();
+    for key in keys {
+        if let Some(path) = tracked.get(&key).map(|t| t.path.clone()) {
+            read_new_lines(component, &path, key, tracked, tx, store, state_cache).await;
+        }
     }
 }
